@@ -80,6 +80,8 @@ pub struct Config {
     pub show_on_start: bool,
     /// 演示模式：不访问硬件，用示例数据预览界面。
     pub demo: bool,
+    /// 外观：auto（跟随系统）/ light / dark。
+    pub theme: String,
     /// 额外的 VID/PID；pid 填 0 表示该 VID 下全部设备。
     #[serde(default)]
     pub extra_devices: Vec<ExtraDevice>,
@@ -92,6 +94,7 @@ impl Default for Config {
             auto_hide: true,
             show_on_start: true,
             demo: false,
+            theme: "auto".to_string(),
             extra_devices: Vec::new(),
         }
     }
@@ -121,8 +124,8 @@ impl Config {
 
     pub fn save(&self) -> Result<(), String> {
         let mut text = format!(
-            "# 电量岛配置\n\n# 自动刷新间隔（秒，最小 5）\nrefresh_secs = {}\n# 窗口失焦时自动隐藏到托盘\nauto_hide = {}\n# 启动时显示一次面板\nshow_on_start = {}\n# 演示模式：不读取硬件，用示例数据预览界面\ndemo = {}\n",
-            self.refresh_secs, self.auto_hide, self.show_on_start, self.demo
+            "# 电量岛配置\n\n# 自动刷新间隔（秒，最小 5）\nrefresh_secs = {}\n# 窗口失焦时自动隐藏到托盘\nauto_hide = {}\n# 启动时显示一次面板\nshow_on_start = {}\n# 演示模式：不读取硬件，用示例数据预览界面\ndemo = {}\n# 外观：auto（跟随系统）/ light / dark\ntheme = \"{}\"\n",
+            self.refresh_secs, self.auto_hide, self.show_on_start, self.demo, self.theme
         );
         for e in &self.extra_devices {
             text.push_str(&format!(

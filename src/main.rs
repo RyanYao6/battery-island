@@ -17,6 +17,7 @@ mod app;
 mod hid;
 mod icons;
 mod model;
+mod theme;
 
 use app::{window_height, BatteryApp, UiEvent, WINDOW_W};
 use model::{Config, Worker};
@@ -221,9 +222,9 @@ pub fn apply_round_region(width: i32, height: i32) {
         if hwnd.is_null() {
             return;
         }
-        // 透明窗口的视口相对窗口矩形有 8px 不可见边框偏移，
-        // 区域从 (8,8) 起才能和 egui 的绘制内容对齐。
-        let rgn = CreateRoundRectRgn(8, 8, width, height, 24, 24);
+        // 区域必须从 (0,0) 起：若整体内缩，DWM 会把窗口内容一并平移，
+        // 导致自绘内容整体右下偏移。
+        let rgn = CreateRoundRectRgn(0, 0, width, height, 24, 24);
         if !rgn.is_null() {
             // SetWindowRgn 成功后系统接管 HRGN，不要 DeleteObject。
             let ok = SetWindowRgn(hwnd, rgn, 1);
@@ -323,8 +324,9 @@ fn main() {
         options,
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
-            // 面板是浅色的，egui 默认深色会让「设置」弹窗显得突兀。
-            cc.egui_ctx.set_visuals(egui::Visuals::light());
+            // 先按配置（auto 时读系统深色模式）解析主题，再同步给 egui 自带控件。
+            let theme = crate::theme::resolve(&cfg.theme);
+            crate::theme::apply_to_egui(&cc.egui_ctx, &theme);
             let worker = Worker::spawn(cfg.clone(), cc.egui_ctx.clone());
             let tray = match build_tray(&cc.egui_ctx, ui_tx) {
                 Ok(t) => t,
@@ -333,7 +335,7 @@ fn main() {
                     return Err(Box::new(std::io::Error::other(e)));
                 }
             };
-            Ok(Box::new(BatteryApp::new(cfg, worker, ui_rx, tray)))
+            Ok(Box::new(BatteryApp::new(cfg, worker, ui_rx, tray, theme)))
         }),
     );
 

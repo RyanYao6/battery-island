@@ -1,58 +1,39 @@
 //! 「电量岛」面板：无边框圆角窗口，全部内容由 egui 自绘。
+//!
+//! 颜色与尺寸都从 [`crate::theme`] 取，浅色 / 深色共用同一套布局代码。
 
-use crate::{icons, model::*, radius};
-use egui::{
-    Align2, Color32, Context, FontId, Id, Painter, Pos2, Rect, Sense, Stroke, Vec2,
-};
+use crate::theme::{corners, metrics, Theme};
+use crate::{icons, model::*};
+use egui::{Align2, Color32, Context, FontId, Id, Painter, Pos2, Rect, Sense, Stroke, Vec2};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 use tray_icon::TrayIcon;
 
-pub const WINDOW_W: f32 = 392.0;
-/// 3 台设备时的面板高度。
-pub const WINDOW_H: f32 = 600.0;
-
+pub const WINDOW_W: f32 = metrics::WINDOW_W;
 /// 面板最多容纳的卡片数，超出部分不再撑高窗口。
 pub const MAX_CARDS: usize = 5;
+/// 窗口矩形里被窗口装饰占用、无法用于客户区的高度。
+const DECOR_Y: f32 = 31.0;
 
-/// 按设备数量动态决定面板高度。
-/// 固定 600px 时只接一台鼠标会让下半屏全空，头重脚轻。
+/// 按设备数量计算面板高度：单设备时尽量紧凑。
 pub fn window_height(count: usize) -> f32 {
-    match count {
-        3 => WINDOW_H,
-        n => 204.0 + 132.0 * n.clamp(1, MAX_CARDS) as f32,
-    }
+    let n = count.clamp(1, MAX_CARDS) as f32;
+    // +DECOR_Y：本机窗口客户区比窗口矩形少 31px（窗口装饰），补回来内容才装得下。
+    DECOR_Y
+        + metrics::SHELL_INSET * 2.0
+        + metrics::HEADER_H
+        + metrics::HEADER_GAP
+        + n * metrics::CARD_H
+        + (n - 1.0) * metrics::CARD_GAP
+        + metrics::CARDS_FOOTER_GAP
+        + metrics::FOOTER_H
 }
-
-const SHELL_BG: Color32 = Color32::from_rgb(0xF3, 0xF6, 0xF8);
-const CARD_BG: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-const TEXT: Color32 = Color32::from_rgb(0x1A, 0x1E, 0x24);
-const MUTED: Color32 = Color32::from_rgb(0x8D, 0x94, 0x9E);
-const ICON_FG: Color32 = Color32::from_rgb(0x54, 0x5C, 0x66);
-const BADGE_BG: Color32 = Color32::from_rgb(0xF3, 0xF5, 0xF6);
-const GREEN: Color32 = Color32::from_rgb(0x0C, 0x86, 0x69);
-const TRACK: Color32 = Color32::from_rgb(0xE7, 0xEB, 0xEC);
-const HOVER: Color32 = Color32::from_rgb(0xE7, 0xEA, 0xED);
-const DIVIDER: Color32 = Color32::from_rgb(0xE4, 0xE8, 0xEB);
-
-const CARD_H: f32 = 118.0;
-const CARD_GAP: f32 = 14.0;
 
 fn regular(size: f32) -> FontId {
     FontId::proportional(size)
 }
 fn bold(size: f32) -> FontId {
     FontId::new(size, egui::FontFamily::Name("Bold".into()))
-}
-
-fn bar_color(v: u8) -> Color32 {
-    if v < 20 {
-        Color32::from_rgb(0xDE, 0x4C, 0x40)
-    } else if v < 40 {
-        Color32::from_rgb(0xE9, 0x96, 0x2C)
-    } else {
-        GREEN
-    }
 }
 
 /// 把时间差写成「刚刚 / N 秒前 / N 分钟前」，比固定时钟更直观。
@@ -70,15 +51,11 @@ fn human_ago(t: &chrono::DateTime<chrono::Local>) -> String {
 }
 
 /// 面板内的两个页面：设备列表 / 设置。
-/// 设置做成内嵌页而不是 egui::Window：独立窗口会带默认标题栏和深色样式，
-/// 还会挡住下面的卡片。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
     Devices,
     Settings,
 }
-
-const SETTINGS_H: f32 = 470.0;
 
 /// 托盘 / 菜单事件，由全局事件处理器转发到 UI 线程。
 #[derive(Debug)]
@@ -91,6 +68,7 @@ pub enum UiEvent {
 
 pub struct BatteryApp {
     pub cfg: Config,
+    pub theme: Theme,
     worker: Worker,
     ui_rx: Receiver<UiEvent>,
     tray: TrayIcon,
@@ -99,6 +77,7 @@ pub struct BatteryApp {
     auto_hide: bool,
     was_focused: bool,
     page: Page,
+    theme_pref: String,
     refresh_secs: u64,
     demo: bool,
     last_tray_value: Option<Option<u8>>,
@@ -110,13 +89,21 @@ pub struct BatteryApp {
 }
 
 impl BatteryApp {
-    pub fn new(cfg: Config, worker: Worker, ui_rx: Receiver<UiEvent>, tray: TrayIcon) -> Self {
+    pub fn new(
+        cfg: Config,
+        worker: Worker,
+        ui_rx: Receiver<UiEvent>,
+        tray: TrayIcon,
+        theme: Theme,
+    ) -> Self {
         let visible = cfg.show_on_start;
         let auto_hide = cfg.auto_hide;
         let refresh_secs = cfg.refresh_secs.max(5);
         let demo = cfg.demo;
+        let theme_pref = cfg.theme.clone();
         Self {
             cfg,
+            theme,
             worker,
             ui_rx,
             tray,
@@ -125,6 +112,7 @@ impl BatteryApp {
             auto_hide,
             was_focused: false,
             page: Page::Devices,
+            theme_pref,
             refresh_secs,
             demo,
             last_tray_value: None,
@@ -147,7 +135,7 @@ impl BatteryApp {
     fn set_page(&mut self, ctx: &Context, page: Page) {
         self.page = page;
         let h = match page {
-            Page::Settings => SETTINGS_H,
+            Page::Settings => metrics::SETTINGS_H + DECOR_Y,
             Page::Devices => window_height(self.snapshot.devices.len()),
         };
         if (h - self.current_h).abs() > 0.5 {
@@ -155,6 +143,14 @@ impl BatteryApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(WINDOW_W, h)));
             ctx.request_repaint();
         }
+    }
+
+    fn apply_theme(&mut self, ctx: &Context) {
+        self.theme = crate::theme::resolve(&self.theme_pref);
+        crate::theme::apply_to_egui(ctx, &self.theme);
+        self.cfg.theme = self.theme_pref.clone();
+        let _ = self.cfg.save();
+        ctx.request_repaint();
     }
 
     fn show(&mut self, ctx: &Context, at: Option<(f64, f64)>) {
@@ -166,7 +162,6 @@ impl BatteryApp {
             let ppp = ctx.pixels_per_point().max(1.0);
             let px = (x / ppp as f64) as f32;
             let py = (y / ppp as f64) as f32;
-            // 托盘图标可能贴着屏幕右边/下边，必须夹住，否则面板会有一半跑到屏幕外。
             let (mw, mh) = ctx.input(|i| {
                 let m = i.viewport().monitor_size.unwrap_or(egui::vec2(1920.0, 1080.0));
                 (m.x, m.y)
@@ -189,7 +184,6 @@ impl BatteryApp {
             return;
         }
         self.last_tray_value = Some(value);
-        // 64×64 在高 DPI 缩放下比 32×32 明显清晰，系统会按需缩小。
         let rgba = icons::tray_rgba(value, 64);
         if let Ok(icon) = tray_icon::Icon::from_rgba(rgba, 64, 64) {
             let _ = self.tray.set_icon(Some(icon));
@@ -209,6 +203,7 @@ impl BatteryApp {
         self.cfg.auto_hide = self.auto_hide;
         self.cfg.refresh_secs = self.refresh_secs;
         self.cfg.demo = self.demo;
+        self.cfg.theme = self.theme_pref.clone();
         self.auto_hide = self.cfg.auto_hide;
         let _ = self.worker.cmd_tx.send(WorkerCmd::SetInterval(self.refresh_secs));
         let _ = self.worker.cmd_tx.send(WorkerCmd::SetDemo(self.demo));
@@ -228,224 +223,183 @@ impl BatteryApp {
         id: &str,
         draw: impl FnOnce(&Painter, Pos2, Color32),
     ) -> bool {
-        let r = Rect::from_center_size(center, Vec2::splat(30.0));
+        let r = Rect::from_center_size(center, Vec2::splat(28.0));
         let resp = ui.interact(r, Id::unique(id), Sense::click());
+        let t = &self.theme;
         if resp.hovered() {
-            p.rect_filled(r, radius(9), HOVER);
+            p.rect_filled(r, corners::CONTROL, t.hover);
         }
-        let color = if resp.hovered() { TEXT } else { ICON_FG };
+        let color = if resp.hovered() { t.text } else { t.muted };
         draw(p, center, color);
         resp.clicked()
     }
 
-    fn paint_cards(&mut self, ui: &mut egui::Ui, p: &Painter, shell: Rect) {
-        let card_w = shell.width() - 36.0;
-        let mut y = shell.top() + 88.0;
-        // 超出面板容量的设备不再绘制，避免卡片画到窗口外面。
-        for d in self.snapshot.devices.iter().take(MAX_CARDS) {
-            let card = Rect::from_min_size(Pos2::new(shell.left() + 18.0, y), Vec2::new(card_w, CARD_H));
-            p.rect_filled(card, radius(16), CARD_BG);
+    /// 单张设备卡片。
+    fn paint_card(&self, ui: &mut egui::Ui, p: &Painter, card: Rect, d: &DeviceState) {
+        let t = &self.theme;
+        p.rect_filled(card, corners::CARD, t.card);
+        p.rect_stroke(
+            card,
+            corners::CARD,
+            Stroke::new(1.0, t.card_stroke),
+            egui::StrokeKind::Inside,
+        );
 
-            let badge = Rect::from_min_size(
-                Pos2::new(card.left() + 16.0, card.top() + 16.0),
-                Vec2::splat(42.0),
-            );
-            icons::device_badge(p, badge, d.kind, ICON_FG, BADGE_BG);
+        let badge = Rect::from_min_size(
+            Pos2::new(card.left() + 14.0, card.top() + 14.0),
+            Vec2::splat(36.0),
+        );
+        icons::device_badge(p, badge, d.kind, t.muted, t.badge);
 
-            p.text(
-                Pos2::new(card.left() + 68.0, card.top() + 18.0),
-                Align2::LEFT_TOP,
-                &d.name,
-                bold(15.0),
-                TEXT,
-            );
-            p.text(
-                Pos2::new(card.left() + 68.0, card.top() + 41.0),
-                Align2::LEFT_TOP,
-                &d.model,
-                regular(12.0),
-                MUTED,
-            );
+        p.text(
+            Pos2::new(card.left() + 62.0, card.top() + 15.0),
+            Align2::LEFT_TOP,
+            &d.name,
+            bold(14.0),
+            t.text,
+        );
+        p.text(
+            Pos2::new(card.left() + 62.0, card.top() + 34.0),
+            Align2::LEFT_TOP,
+            &d.model,
+            regular(11.0),
+            t.muted,
+        );
 
-            let value = match d.battery {
-                Some(v) if d.connected => format!("{v}%"),
-                _ => "—".to_string(),
-            };
-            let value_color = if d.connected { TEXT } else { Color32::from_rgb(0x4A, 0x50, 0x58) };
-            p.text(
-                Pos2::new(card.right() - 16.0, card.top() + 36.0),
-                Align2::RIGHT_CENTER,
-                value,
-                bold(32.0),
-                value_color,
-            );
+        let value = match d.battery {
+            Some(v) if d.connected => format!("{v}%"),
+            _ => "—".to_string(),
+        };
+        let value_color = if d.connected { t.text } else { t.faint };
+        p.text(
+            Pos2::new(card.right() - 14.0, card.top() + 28.0),
+            Align2::RIGHT_CENTER,
+            value,
+            bold(22.0),
+            value_color,
+        );
 
-            let bar_y = card.top() + 84.0;
-            let bar = Rect::from_min_size(
-                Pos2::new(card.left() + 16.0, bar_y),
-                Vec2::new(card_w - 32.0 - 62.0, 6.0),
-            );
-            p.rect_filled(bar, radius(3), TRACK);
-            if let Some(v) = d.battery.filter(|_| d.connected) {
-                let w = bar.width() * (v.min(100) as f32 / 100.0);
+        // 进度条
+        let bar_cy = card.top() + 68.0;
+        let bar_right = card.right() - 14.0 - 54.0;
+        let bar = Rect::from_min_max(
+            Pos2::new(card.left() + 14.0, bar_cy - 2.0),
+            Pos2::new(bar_right, bar_cy + 2.0),
+        );
+        p.rect_filled(bar, corners::CONTROL, t.track);
+        if let Some(v) = d.battery.filter(|_| d.connected) {
+            let w = bar.width() * (v.min(100) as f32 / 100.0);
+            if w > 0.5 {
                 p.rect_filled(
                     Rect::from_min_size(bar.min, Vec2::new(w, bar.height())),
-                    radius(3),
-                    bar_color(v),
+                    corners::CONTROL,
+                    t.battery_color(v, d.charging),
                 );
             }
-            p.text(
-                Pos2::new(card.right() - 16.0, bar_y + 3.0),
-                Align2::RIGHT_CENTER,
-                d.status_text(),
-                regular(12.0),
-                MUTED,
-            );
-
-            // 悬停显示协议诊断信息，方便现场适配新固件；同时给一点视觉反馈。
-            let hover_id = Id::unique(("card", d.key.as_str()));
-            let resp = ui.interact(card, hover_id, Sense::hover());
-            if resp.hovered() {
-                p.rect_stroke(
-                    card,
-                    radius(16),
-                    Stroke::new(1.0, Color32::from_rgb(0xD5, 0xDB, 0xE0)),
-                    egui::StrokeKind::Inside,
-                );
-                if !d.detail.is_empty() {
-                    let _ = resp.clone().on_hover_text(d.detail.as_str());
-                }
-            }
-            y += CARD_H + CARD_GAP;
-        }
-    }
-
-    fn paint(&mut self, ui: &mut egui::Ui, ctx: &Context) {
-        // 不透明窗口直接用 egui 视口矩形铺满面板色，圆角由 SetWindowRgn 裁切。
-        let screen = ctx.viewport_rect();
-        let full = Rect::from_min_size(screen.min, screen.size());
-        let p = ui.painter().with_clip_rect(full);
-        p.rect_filled(full, radius(24), SHELL_BG);
-        // shell 只作为内容排版参考，保留 8px 视觉内边距。
-        let shell = full.shrink(8.0);
-
-        // ---- 顶部标题栏 ----
-        let hy = shell.top() + 22.0;
-        let logo_box = Rect::from_min_size(Pos2::new(shell.left() + 18.0, hy), Vec2::splat(38.0));
-        p.rect_filled(logo_box, radius(12), CARD_BG);
-        icons::logo(&p, logo_box.center(), GREEN);
-
-        p.text(
-            Pos2::new(shell.left() + 66.0, hy + 1.0),
-            Align2::LEFT_TOP,
-            "电量岛",
-            bold(21.0),
-            TEXT,
-        );
-        p.text(
-            Pos2::new(shell.left() + 66.0, hy + 29.0),
-            Align2::LEFT_TOP,
-            "所有设备，一眼可见",
-            regular(12.0),
-            MUTED,
-        );
-
-        let gear = self.icon_button(
-            ui,
-            &p,
-            Pos2::new(shell.right() - 68.0, hy + 19.0),
-            "btn-settings",
-            icons::sliders,
-        );
-        if gear {
-            let next = match self.page {
-                Page::Devices => Page::Settings,
-                Page::Settings => Page::Devices,
-            };
-            self.set_page(ctx, next);
-        }
-        let close = self.icon_button(
-            ui,
-            &p,
-            Pos2::new(shell.right() - 32.0, hy + 19.0),
-            "btn-close",
-            icons::close,
-        );
-        if close {
-            self.hide(ctx);
         }
 
-        // ---- 设备卡片 / 设置页 ----
-        match self.page {
-            Page::Devices => self.paint_cards(ui, &p, shell),
-            Page::Settings => self.paint_settings(ui, shell),
-        }
-
-        // ---- 底部状态栏 ----
-        // 透明窗口下 egui 的可用区域比窗口客户区略高，底部栏要留足余量，
-        // 否则「上次更新」和刷新图标会被窗口底边裁掉一半。
-        let fy = shell.bottom() - 56.0;
-        p.line_segment(
-            [Pos2::new(shell.left() + 18.0, fy), Pos2::new(shell.right() - 18.0, fy)],
-            Stroke::new(1.0, DIVIDER),
-        );
-        let stamp = match self.snapshot.updated_at {
-            Some(t) => format!("上次更新 {}", human_ago(&t)),
-            None => "尚未更新".to_string(),
-        };
-        let mut label = if self.toast.is_empty() {
-            stamp
+        // 状态：小圆点 + 文字，右对齐到卡片内边距
+        let (dot, label) = if !d.connected {
+            (t.faint, d.status_text())
+        } else if d.charging {
+            (t.charging, d.status_text())
         } else {
-            format!("{stamp}   ·   {}", self.toast)
+            (t.accent, d.status_text())
         };
-        let hidden = self.snapshot.devices.len().saturating_sub(MAX_CARDS);
-        if hidden > 0 {
-            label.push_str(&format!("   ·   +{hidden} 台"));
-        }
-        p.text(
-            Pos2::new(shell.left() + 20.0, fy + 22.0),
-            Align2::LEFT_CENTER,
-            label,
-            regular(12.0),
-            MUTED,
+        let galley = p.layout_no_wrap(label, regular(11.0), t.muted);
+        let tw = galley.size().x;
+        let x_right = card.right() - 14.0;
+        p.galley(
+            Pos2::new(x_right - tw, bar_cy - galley.size().y / 2.0),
+            galley,
+            t.muted,
         );
-        if self.icon_button(
-            ui,
-            &p,
-            Pos2::new(shell.right() - 32.0, fy + 22.0),
-            "btn-refresh",
-            icons::refresh,
-        ) {
-            self.refresh();
-            self.toast.clear();
+        p.circle_filled(Pos2::new(x_right - tw - 9.0, bar_cy), 2.5, dot);
+
+        // 悬停显示协议诊断，同时给一点视觉反馈
+        let hover_id = Id::unique(("card", d.key.as_str()));
+        let resp = ui.interact(card, hover_id, Sense::hover());
+        if resp.hovered() {
+            p.rect_stroke(
+                card,
+                corners::CARD,
+                Stroke::new(1.0, t.faint),
+                egui::StrokeKind::Inside,
+            );
+            if !d.detail.is_empty() {
+                let _ = resp.clone().on_hover_text(d.detail.as_str());
+            }
         }
     }
 
-    /// 设置作为面板内的一页绘制，不再弹独立窗口：
-    /// 独立窗口的标题栏、阴影和深色默认样式跟浅色面板格格不入，还会盖住卡片。
-    fn paint_settings(&mut self, ui: &mut egui::Ui, shell: Rect) {
+    fn paint_cards(&self, ui: &mut egui::Ui, p: &Painter, shell: Rect) {
+        let content = Rect::from_min_max(
+            Pos2::new(shell.left() + metrics::PAD, shell.top() + metrics::HEADER_H + metrics::HEADER_GAP),
+            Pos2::new(shell.right() - metrics::PAD, shell.bottom()),
+        );
+        let mut y = content.top();
+        for d in self.snapshot.devices.iter().take(MAX_CARDS) {
+            let card = Rect::from_min_size(
+                Pos2::new(content.left(), y),
+                Vec2::new(content.width(), metrics::CARD_H),
+            );
+            self.paint_card(ui, p, card, d);
+            y += metrics::CARD_H + metrics::CARD_GAP;
+        }
+    }
+
+    /// 设置作为面板内的一页绘制，不再弹独立窗口。
+    fn paint_settings(&mut self, ui: &mut egui::Ui, ctx: &Context, p: &Painter, shell: Rect) {
         use egui::{RichText, UiBuilder};
 
-        let rect = Rect::from_min_size(
-            Pos2::new(shell.left() + 18.0, shell.top() + 84.0),
-            Vec2::new(shell.width() - 36.0, shell.bottom() - 84.0 - 62.0),
+        let t = self.theme;
+        let card = Rect::from_min_max(
+            Pos2::new(shell.left() + metrics::PAD, shell.top() + metrics::HEADER_H + metrics::HEADER_GAP),
+            Pos2::new(
+                shell.right() - metrics::PAD,
+                shell.bottom() - metrics::FOOTER_H - metrics::CARDS_FOOTER_GAP,
+            ),
         );
+        p.rect_filled(card, corners::CARD, t.card);
+        p.rect_stroke(
+            card,
+            corners::CARD,
+            Stroke::new(1.0, t.card_stroke),
+            egui::StrokeKind::Inside,
+        );
+
+        let inner = card.shrink(metrics::PAD);
         ui.scope_builder(
             UiBuilder::new()
-                .max_rect(rect)
+                .max_rect(inner)
                 .layout(egui::Layout::top_down(egui::Align::Min)),
             |ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 10.0);
-                // 诊断展开后内容会变高，用滚动兜住，不让它顶出面板。
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.label(RichText::new("偏好设置").size(15.0).color(TEXT));
+                        ui.label(RichText::new("外观").size(11.0).color(t.muted));
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("自动刷新").size(13.0).color(MUTED));
+                            for (value, label) in
+                                [("auto", "跟随系统"), ("light", "浅色"), ("dark", "深色")]
+                            {
+                                if ui
+                                    .selectable_label(self.theme_pref == value, label)
+                                    .clicked()
+                                {
+                                    self.theme_pref = value.to_string();
+                                    self.apply_theme(ctx);
+                                }
+                            }
+                        });
+
+                        ui.add_space(2.0);
+                        ui.label(RichText::new("偏好设置").size(11.0).color(t.muted));
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("自动刷新").size(12.5).color(t.text));
                             egui::ComboBox::from_id_salt("refresh-interval")
                                 .selected_text(format!("{} 秒", self.refresh_secs))
-                                .width(88.0)
+                                .width(84.0)
                                 .show_ui(ui, |ui| {
                                     for s in [15u64, 30, 60, 300] {
                                         ui.selectable_value(
@@ -458,35 +412,32 @@ impl BatteryApp {
                         });
                         ui.checkbox(
                             &mut self.auto_hide,
-                            RichText::new("窗口失焦时自动隐藏到托盘").size(13.0),
+                            RichText::new("窗口失焦时自动隐藏到托盘").size(12.5),
                         );
                         ui.checkbox(
                             &mut self.demo,
-                            RichText::new("演示模式（不读取硬件）").size(13.0),
+                            RichText::new("演示模式（不读取硬件）").size(12.5),
                         );
+
+                        ui.add_space(2.0);
                         ui.separator();
                         ui.label(
-                            RichText::new("协议：Feature Report 0x11 / 命令 0x06")
-                                .size(11.5)
-                                .color(MUTED),
-                        );
-                        ui.label(
-                            RichText::new("VID 5253 / 3837 · UsagePage FF01 / FF0B")
-                                .size(11.5)
-                                .color(MUTED),
+                            RichText::new("Feature Report 0x11 / 命令 0x06 · 65 字节")
+                                .size(11.0)
+                                .color(t.faint),
                         );
                         egui::CollapsingHeader::new(
-                            RichText::new("本次扫描诊断").size(12.5).color(MUTED),
+                            RichText::new("本次扫描诊断").size(11.5).color(t.muted),
                         )
                         .show(ui, |ui| {
                             ui.label(
                                 RichText::new(self.snapshot.note.as_str())
-                                    .size(11.5)
-                                    .color(MUTED),
+                                    .size(11.0)
+                                    .color(t.faint),
                             );
                         });
                         ui.horizontal(|ui| {
-                            if ui.button("保存并刷新").clicked() {
+                            if ui.button("保存").clicked() {
                                 self.apply_settings();
                             }
                             if ui.button("重新扫描").clicked() {
@@ -497,17 +448,140 @@ impl BatteryApp {
             },
         );
     }
+
+    fn paint(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        let t = self.theme;
+        // 窗口顶部 DECOR_Y 被窗口装饰占用，客户区从它下面开始；
+        // 面板按客户区坐标 (0,0) 起绘制即可完整落在可见区内。
+        let panel = Rect::from_min_size(
+            Pos2::new(0.0, 0.0),
+            Vec2::new(WINDOW_W, self.current_h - DECOR_Y),
+        );
+        let p = ui.painter().with_clip_rect(panel);
+        p.rect_filled(panel, corners::SHELL, t.shell);
+        let full = panel;
+        let _ = full;
+
+        // 面板四周留 SHELL_INSET 作为视觉边距。
+        let shell = full.shrink(metrics::SHELL_INSET);
+        {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            ONCE.get_or_init(|| {
+                crate::log_line(&format!(
+                    "布局: current_h={} ppp={} viewport={:?} content={:?} max_rect={:?} clip={:?} tf={:?}",
+                    self.current_h,
+                    ctx.pixels_per_point(),
+                    ctx.viewport_rect(),
+                    ctx.content_rect(),
+                    ui.max_rect(),
+                    ui.painter().clip_rect(),
+                    ctx.layer_transform_from_global(ui.layer_id())
+                ));
+            });
+        }
+        let header_cy = shell.top() + metrics::HEADER_H / 2.0 + 3.0;
+
+        // ---- 顶栏 ----
+        let logo = Rect::from_min_size(
+            Pos2::new(shell.left() + metrics::PAD, shell.top() + 13.0),
+            Vec2::splat(32.0),
+        );
+        p.rect_filled(logo, corners::BADGE, t.card);
+        icons::logo(&p, logo.center(), t.accent);
+
+        p.text(
+            Pos2::new(logo.right() + 10.0, logo.top() - 2.0),
+            Align2::LEFT_TOP,
+            "电量岛",
+            bold(17.0),
+            t.text,
+        );
+        let total = self.snapshot.devices.len();
+        let online = self.snapshot.devices.iter().filter(|d| d.connected).count();
+        let subtitle = if total == 0 {
+            "正在扫描设备".to_string()
+        } else if online == 0 {
+            format!("{total} 台设备 · 均未响应")
+        } else {
+            format!("{online} / {total} 台在线")
+        };
+        p.text(
+            Pos2::new(logo.right() + 10.0, logo.top() + 21.0),
+            Align2::LEFT_TOP,
+            subtitle,
+            regular(11.0),
+            t.muted,
+        );
+
+        let gear_center = Pos2::new(shell.right() - metrics::PAD - 14.0, header_cy);
+        let close_center = Pos2::new(gear_center.x - 34.0, header_cy);
+        if self.icon_button(ui, &p, gear_center, "btn-settings", icons::sliders) {
+            let next = match self.page {
+                Page::Devices => Page::Settings,
+                Page::Settings => Page::Devices,
+            };
+            self.set_page(ctx, next);
+        }
+        if self.icon_button(ui, &p, close_center, "btn-close", icons::close) {
+            self.hide(ctx);
+        }
+
+        // ---- 主体 ----
+        match self.page {
+            Page::Devices => self.paint_cards(ui, &p, shell),
+            Page::Settings => self.paint_settings(ui, ctx, &p, shell),
+        }
+
+        // ---- 底栏 ----
+        let fy = shell.bottom() - metrics::FOOTER_H;
+        let fcy = fy + metrics::FOOTER_H / 2.0;
+        p.line_segment(
+            [
+                Pos2::new(shell.left() + metrics::PAD, fy),
+                Pos2::new(shell.right() - metrics::PAD, fy),
+            ],
+            Stroke::new(1.0, t.divider),
+        );
+        let stamp = match self.snapshot.updated_at {
+            Some(ts) => format!("上次更新 {}", human_ago(&ts)),
+            None => "尚未更新".to_string(),
+        };
+        let mut label = if self.toast.is_empty() {
+            stamp
+        } else {
+            format!("{stamp}   ·   {}", self.toast)
+        };
+        let hidden = self.snapshot.devices.len().saturating_sub(MAX_CARDS);
+        if hidden > 0 {
+            label.push_str(&format!("   ·   +{hidden} 台"));
+        }
+        p.text(
+            Pos2::new(shell.left() + metrics::PAD + 2.0, fcy),
+            Align2::LEFT_CENTER,
+            label,
+            regular(11.0),
+            t.muted,
+        );
+        if self.icon_button(
+            ui,
+            &p,
+            Pos2::new(shell.right() - metrics::PAD - 14.0, fcy),
+            "btn-refresh",
+            icons::refresh,
+        ) {
+            self.refresh();
+            self.toast.clear();
+        }
+    }
 }
 
 impl eframe::App for BatteryApp {
-    /// 完全透明清屏，避免 eframe 默认深灰造成的黑边；
-    /// 四角形状由 SetWindowRgn 裁切，圆角外透出桌面。
+    /// 完全透明清屏，四角形状由 SetWindowRgn 裁切，圆角外透出桌面。
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0]
     }
 
     /// eframe 0.37 起，窗口隐藏时不会跑 egui pass，但 `logic` 仍会被调用。
-    /// 托盘事件、后台快照、显隐控制全部放在这里，保证收进托盘后依然在线。
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         #[cfg(windows)]
         {
@@ -519,9 +593,9 @@ impl eframe::App for BatteryApp {
             }
         }
 
-        // 「配置已保存」之类的瞬时提示只留 3 秒，否则会一直挂在底部栏。
-        if let Some(t) = self.toast_at {
-            if t.elapsed() >= Duration::from_secs(3) {
+        // 「配置已保存」之类的瞬时提示只留 3 秒。
+        if let Some(ts) = self.toast_at {
+            if ts.elapsed() >= Duration::from_secs(3) {
                 self.toast.clear();
                 self.toast_at = None;
             }
@@ -535,7 +609,6 @@ impl eframe::App for BatteryApp {
         }
         if changed {
             self.sync_tray();
-            // 设备数量变化时收紧/展开面板，避免单设备时留下大片空白。
             let n = self.snapshot.devices.len();
             if n != self.last_device_count {
                 self.last_device_count = n;
@@ -558,7 +631,7 @@ impl eframe::App for BatteryApp {
                     let now = std::time::Instant::now();
                     let is_double = self
                         .last_tray_click
-                        .map(|t| now.duration_since(t) < Duration::from_millis(320))
+                        .map(|ts| now.duration_since(ts) < Duration::from_millis(320))
                         .unwrap_or(false);
                     self.last_tray_click = Some(now);
                     if is_double {
@@ -612,10 +685,9 @@ impl eframe::App for BatteryApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 不再套 CentralPanel：它会在 root Ui 里留出内边距，
+        // 导致所有自绘内容整体右下偏移（实测约 (8, 31)）。
         let ctx = ui.ctx().clone();
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ui, |ui| self.paint(ui, &ctx));
+        self.paint(ui, &ctx);
     }
 }
-
