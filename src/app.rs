@@ -158,6 +158,9 @@ impl BatteryApp {
         self.visible = true;
         // 重新显示时先不认为「曾经获得焦点」，否则会被失焦自动隐藏立刻收起。
         self.was_focused = false;
+        // 每次显示前都重设一次窗口样式：显示动作可能触发 winit 回写边框样式。
+        #[cfg(windows)]
+        crate::apply_round_region(WINDOW_W as i32, self.current_h as i32);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         if let Some((x, y)) = at {
             let ppp = ctx.pixels_per_point().max(1.0);
@@ -462,21 +465,6 @@ impl BatteryApp {
 
         // 面板四周留 SHELL_INSET 作为视觉边距。
         let shell = full.shrink(metrics::SHELL_INSET);
-        {
-            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-            ONCE.get_or_init(|| {
-                crate::log_line(&format!(
-                    "布局: current_h={} ppp={} viewport={:?} content={:?} max_rect={:?} clip={:?} tf={:?}",
-                    self.current_h,
-                    ctx.pixels_per_point(),
-                    ctx.viewport_rect(),
-                    ctx.content_rect(),
-                    ui.max_rect(),
-                    ui.painter().clip_rect(),
-                    ctx.layer_transform_from_global(ui.layer_id())
-                ));
-            });
-        }
         let header_cy = shell.top() + metrics::HEADER_H / 2.0 + 3.0;
 
         // ---- 顶栏 ----
