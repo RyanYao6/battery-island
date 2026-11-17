@@ -208,6 +208,36 @@ fn probe_battery(cfg: &Config) -> String {
     out
 }
 
+/// 把窗口样式改成纯弹出式（WS_POPUP）。
+///
+/// winit 的无边框窗口在 Windows 上仍会保留 `WS_CAPTION | WS_BORDER`，
+/// 系统因此会：
+///   1. 在窗口矩形最顶端画一条 1px 的浅色边框线（会露在面板上方，像一条白线）；
+///   2. 让客户区整体相对窗口矩形下移 31px、右移 8px，自绘内容跟着偏移。
+/// 去掉这些样式后客户区与窗口矩形完全重合，两个问题一起消失。
+#[cfg(windows)]
+fn make_popup_window(hwnd: windows_sys::Win32::Foundation::HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, WS_POPUP, WS_VISIBLE,
+    };
+
+    unsafe {
+        let style = (WS_POPUP | WS_VISIBLE) as isize;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+        // 让系统按新样式重算非客户区，否则旧边框仍会残留一帧。
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+        );
+    }
+}
+
 /// 用 Win32 窗口区域把无边框窗口裁成圆角。
 /// 透明窗口 + 自绘圆角在 Windows 上会被 DWM 的不可见边框裁掉底部两角，
 /// 改由系统裁切窗口形状最可靠，也不依赖 Windows 11 的 DWM 圆角属性。
@@ -222,9 +252,10 @@ pub fn apply_round_region(width: i32, height: i32) {
         if hwnd.is_null() {
             return;
         }
-        // 区域必须从 (0,0) 起：若整体内缩，DWM 会把窗口内容一并平移，
-        // 导致自绘内容整体右下偏移。
-        let rgn = CreateRoundRectRgn(0, 0, width, height, 24, 24);
+        make_popup_window(hwnd);
+        // 区域从第 1 行起裁：系统会在窗口最顶端留一条 1px 边框线，
+        // 它位于 egui 可绘制区之外，只能靠窗口区域切掉。
+        let rgn = CreateRoundRectRgn(0, 1, width, height, 24, 24);
         if !rgn.is_null() {
             // SetWindowRgn 成功后系统接管 HRGN，不要 DeleteObject。
             let ok = SetWindowRgn(hwnd, rgn, 1);
@@ -315,7 +346,8 @@ fn main() {
             .with_always_on_top()
             // 托盘常驻工具不该占任务栏和 Alt-Tab 列表。
             .with_taskbar(false)
-            .with_visible(cfg.show_on_start),
+            // 先隐藏创建：等窗口样式改成无边框后再显示，避免闪一下标题栏。
+            .with_visible(false),
         ..Default::default()
     };
 

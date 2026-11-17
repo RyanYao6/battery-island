@@ -12,7 +12,7 @@ pub mod metrics {
     pub const CARD_H: f32 = 92.0;
     pub const CARD_GAP: f32 = 10.0;
     pub const FOOTER_H: f32 = 44.0;
-    pub const SETTINGS_H: f32 = 460.0;
+    pub const SETTINGS_H: f32 = 432.0;
     /// 顶栏与第一张卡片之间
     pub const HEADER_GAP: f32 = 10.0;
     /// 最后一张卡片与底栏之间
@@ -129,6 +129,13 @@ pub fn resolve(pref: &str) -> Theme {
 /// 把主题同步给 egui 自带控件（复选框、下拉框、按钮），
 /// 免得设置页里出现和面板割裂的默认配色。
 pub fn apply_to_egui(ctx: &egui::Context, t: &Theme) {
+    // 先把 egui 自己的主题偏好定下来，否则它每帧会按系统主题把内置控件
+    // （复选框、按钮、下拉框）重置回浅色，深色面板里就会出现白块。
+    ctx.set_theme(if t.dark {
+        egui::ThemePreference::Dark
+    } else {
+        egui::ThemePreference::Light
+    });
     let mut v = if t.dark {
         egui::Visuals::dark()
     } else {

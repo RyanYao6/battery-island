@@ -12,15 +12,10 @@ use tray_icon::TrayIcon;
 pub const WINDOW_W: f32 = metrics::WINDOW_W;
 /// 面板最多容纳的卡片数，超出部分不再撑高窗口。
 pub const MAX_CARDS: usize = 5;
-/// 窗口矩形里被窗口装饰占用、无法用于客户区的高度。
-const DECOR_Y: f32 = 31.0;
-
 /// 按设备数量计算面板高度：单设备时尽量紧凑。
 pub fn window_height(count: usize) -> f32 {
     let n = count.clamp(1, MAX_CARDS) as f32;
-    // +DECOR_Y：本机窗口客户区比窗口矩形少 31px（窗口装饰），补回来内容才装得下。
-    DECOR_Y
-        + metrics::SHELL_INSET * 2.0
+    metrics::SHELL_INSET * 2.0
         + metrics::HEADER_H
         + metrics::HEADER_GAP
         + n * metrics::CARD_H
@@ -85,6 +80,10 @@ pub struct BatteryApp {
     current_h: f32,
     toast: String,
     toast_at: Option<std::time::Instant>,
+    /// 首帧是否已完成「先改窗口样式、再显示」的初始化。
+    booted: bool,
+    /// 显示后再补一次样式修正，避免 winit 在显示时把边框加回来。
+    restyle_at: Option<std::time::Instant>,
     last_tray_click: Option<std::time::Instant>,
 }
 
@@ -121,6 +120,8 @@ impl BatteryApp {
             toast: String::new(),
             toast_at: None,
             last_tray_click: None,
+            booted: false,
+            restyle_at: None,
         }
     }
 
@@ -135,7 +136,7 @@ impl BatteryApp {
     fn set_page(&mut self, ctx: &Context, page: Page) {
         self.page = page;
         let h = match page {
-            Page::Settings => metrics::SETTINGS_H + DECOR_Y,
+            Page::Settings => metrics::SETTINGS_H,
             Page::Devices => window_height(self.snapshot.devices.len()),
         };
         if (h - self.current_h).abs() > 0.5 {
@@ -451,12 +452,9 @@ impl BatteryApp {
 
     fn paint(&mut self, ui: &mut egui::Ui, ctx: &Context) {
         let t = self.theme;
-        // 窗口顶部 DECOR_Y 被窗口装饰占用，客户区从它下面开始；
-        // 面板按客户区坐标 (0,0) 起绘制即可完整落在可见区内。
-        let panel = Rect::from_min_size(
-            Pos2::new(0.0, 0.0),
-            Vec2::new(WINDOW_W, self.current_h - DECOR_Y),
-        );
+        // 窗口样式已改成 WS_POPUP，客户区与窗口矩形重合，直接按 (0,0) 起绘制。
+        // 最顶端 1px 由窗口区域裁掉（系统边框），所以面板从第 1 行开始可见。
+        let panel = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(WINDOW_W, self.current_h));
         let p = ui.painter().with_clip_rect(panel);
         p.rect_filled(panel, corners::SHELL, t.shell);
         let full = panel;
@@ -583,6 +581,31 @@ impl eframe::App for BatteryApp {
 
     /// eframe 0.37 起，窗口隐藏时不会跑 egui pass，但 `logic` 仍会被调用。
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        {
+            if !self.booted {
+                // 窗口是隐藏创建的。趁它还没露面，先把样式改成无边框并裁好圆角，
+                // 否则用户会看到一帧系统标题栏，而且客户区会带着 8/31px 的偏移。
+                self.booted = true;
+                crate::apply_round_region(WINDOW_W as i32, self.current_h as i32);
+                // 触发一次尺寸同步，让渲染表面按新客户区重建。
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    WINDOW_W,
+                    self.current_h,
+                )));
+                if self.cfg.show_on_start {
+                    self.show(ctx, None);
+                }
+                // 显示动作由 winit 异步处理，可能把边框样式加回来，稍后再修一次。
+                self.restyle_at = Some(std::time::Instant::now() + Duration::from_millis(260));
+                ctx.request_repaint();
+            }
+            if self.restyle_at.map(|t| std::time::Instant::now() >= t).unwrap_or(false) {
+                self.restyle_at = None;
+                crate::apply_round_region(WINDOW_W as i32, self.current_h as i32);
+            }
+        }
+
         #[cfg(windows)]
         {
             use std::sync::atomic::{AtomicU32, Ordering};
