@@ -1,0 +1,24 @@
+# 电量岛配置（程序同目录）
+
+# 自动刷新间隔（秒，最小 5）
+refresh_secs = 30
+
+# 窗口失焦时自动隐藏到托盘
+auto_hide = true
+
+# 启动时显示一次面板（false = 启动后只驻留托盘）
+show_on_start = true
+
+# 演示模式：不读取硬件，用示例数据预览界面
+demo = false
+
+# 额外设备：如果接收器的 VID/PID 不在内置列表里，可在这里声明。
+# pid 填 0 表示该 VID 下所有设备都尝试读取。
+# usage_page 省略时会放宽匹配条件。
+#
+# [[extra_devices]]
+# vid = 0x5253
+# pid = 0x1020
+# usage_page = 0xFF01
+# name = "迈从 L7 Pro"
+# model = "L7 Pro · 2.4G"

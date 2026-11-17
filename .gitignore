@@ -1,0 +1,15 @@
+/target
+Cargo.lock
+**/*.rs.bk
+*.log
+*.pdb
+
+# 运行时生成的诊断报告
+battery-island-dump.txt
+battery-island-reading.txt
+README-CLI.txt
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

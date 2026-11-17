@@ -1,0 +1,27 @@
+[package]
+name = "battery-island"
+version = "0.1.0"
+edition = "2021"
+description = "2.4G 无线外设电量小工具 - 托盘常驻，支持迈从 L7 Pro"
+authors = ["RyanYao6"]
+license = "MIT"
+repository = "https://github.com/RyanYao6/battery-island"
+readme = "README.md"
+keywords = ["hid", "battery", "egui", "tray", "mchose"]
+categories = ["hardware-support", "gui"]
+
+[dependencies]
+chrono = "0.4.45"
+# 只要 OpenGL 后端，默认 feature 会拉入整套 wgpu（体积大、编译慢）
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.37.0"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.1"
+tray-icon = "0.26.1"
+
+[target."cfg(windows)".dependencies]
+hidapi = { version = "2.6.7", default-features = false, features = ["windows-native"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
+
+[target."cfg(not(windows))".dependencies]
+hidapi = "2.6.7"
