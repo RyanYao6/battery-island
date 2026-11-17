@@ -426,7 +426,7 @@ impl BatteryApp {
                         ui.add_space(2.0);
                         ui.separator();
                         ui.label(
-                            RichText::new("Feature Report 0x11 / 命令 0x06 · 65 字节")
+                            RichText::new("迈从 Feature 0x11/0x06 · 狼蛛查询 20 01 · 33 字节")
                                 .size(11.0)
                                 .color(t.faint),
                         );

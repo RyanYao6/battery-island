@@ -1,6 +1,8 @@
-//! 迈从 MCHOSE L7 Pro 2.4G 电量读取（HID Feature Report）。
+//! 2.4G 无线外设电量读取。
 //!
-//! 帧格式（65 字节，Report ID `0x11`，命令 `0x06`）：
+//! 目前支持两套协议：
+//!
+//! **迈从 MCHOSE L7 Pro（HID Feature Report）**
 //!
 //! ```text
 //! 请求：11 F9 FF×63              命令与填充字节逐字节取反
@@ -11,13 +13,18 @@
 //! payload[9]     电量百分比      payload[10]    充电状态
 //! ```
 //!
-//! 部分固件的报告长度是 21 字节（20 字节载荷 + Report ID）。读取时依次尝试
-//! 65 与 21 字节、取反与不取反四种组合，命中合法读数即返回。
+//! **狼蛛 AULA F98 Pro（2.4G 接收器，中断 IN/OUT 报告）**
 //!
-//! 设备空闲时可能把刚写入的帧原样回显（表现为 GET_FEATURE 假成功），
-//! 因此每次都成对执行 Set + Get 并重试，同时校验 `vid != 0` 与 `battery <= 100`。
+//! ```text
+//! 请求（33 字节，Report ID 0x00）：00 20 01 00 00 …
+//! 响应（33 字节）：              20 01 00 64 00 … 85
+//!                                └ 帧头  └ 电量 └ 校验和 = 前面所有字节之和
+//! ```
 //!
-//! 本模块只发送读取命令，不写入 DPI / 灯效 / 配置，不会改动鼠标设置。
+//! 接收器没有任何 Feature Report，只能走输出报告 + 输入报告。
+//! 电量取帧头之后的第 3 个字节（0x64 = 100%），范围 0..=100。
+//!
+//! 本模块只发送读取命令，不写入 DPI / 灯效 / 配置，不会改动设备设置。
 
 use hidapi::{DeviceInfo, HidApi, HidDevice};
 use std::ffi::CString;
@@ -39,6 +46,25 @@ pub const KNOWN_VIDS: [u16; 2] = [0x5253, 0x3837];
 pub const VENDOR_USAGE_PAGES: [u16; 2] = [0xFF01, 0xFF0B];
 /// L7 Pro 及同系列接收器常见 PID。
 pub const L7_FAMILY_PIDS: [u16; 5] = [0x00B0, 0x1020, 0x1021, 0x1019, 0x1024];
+
+/// 狼蛛 2.4G 接收器（F98 Pro 等）的 VID/PID。
+pub const AULA_VID: u16 = 0x05AC;
+pub const AULA_PIDS: [u16; 1] = [0x024F];
+/// AULA 接收器的 raw HID 集合（32 字节报文 + Report ID）。
+pub const AULA_USAGE_PAGE: u16 = 0xFF60;
+/// 查询帧总长度（含 Report ID）。
+pub const AULA_REPORT_LEN: usize = 33;
+/// 电量查询的帧头。
+const AULA_CMD: [u8; 2] = [0x20, 0x01];
+
+/// 设备使用的电量协议。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    /// 迈从特征报告 0x11 / 0x06。
+    Feature,
+    /// 狼蛛 2.4G 接收器的中断报告查询。
+    AulaRaw,
+}
 
 /// 用户通过配置文件额外声明的设备。
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -69,6 +95,10 @@ pub struct Candidate {
     pub display_model: Option<String>,
     /// 排序权重：越小越优先。
     pub priority: u8,
+    /// 该接口使用哪套电量协议。
+    pub protocol: Protocol,
+    /// 是否按键盘显示（图标 / 文案）。
+    pub keyboard: bool,
 }
 
 impl Candidate {
@@ -115,6 +145,27 @@ pub fn find_candidates(api: &HidApi, extra: &[ExtraDevice]) -> Vec<Candidate> {
             .iter()
             .find(|e| e.vid == vid && (e.pid == pid || e.pid == 0));
 
+        // ---- 狼蛛 AULA 接收器：只有中断报告，没有 Feature Report ----
+        if vid == AULA_VID && AULA_PIDS.contains(&pid) && page == AULA_USAGE_PAGE {
+            out.push(Candidate {
+                path: info.path().to_owned(),
+                vid,
+                pid,
+                usage_page: page,
+                usage: info.usage(),
+                interface: info.interface_number(),
+                product,
+                serial: info.serial_number().unwrap_or_default().trim().to_string(),
+                display_name: Some("狼蛛 F98 Pro".to_string()),
+                display_model: Some("F98 Pro · 2.4G".to_string()),
+                // 32 字节报文在 interface 3；interface 4 是 64 字节的另一套集合，排后面。
+                priority: if info.interface_number() == 3 { 0 } else { 6 },
+                protocol: Protocol::AulaRaw,
+                keyboard: true,
+            });
+            continue;
+        }
+
         let vendor_known = KNOWN_VIDS.contains(&vid);
         let page_ok = VENDOR_USAGE_PAGES.contains(&page)
             || extra_match.and_then(|e| e.usage_page).map_or(false, |p| p == page);
@@ -153,6 +204,8 @@ pub fn find_candidates(api: &HidApi, extra: &[ExtraDevice]) -> Vec<Candidate> {
             display_name: extra_match.and_then(|e| e.name.clone()),
             display_model: extra_match.and_then(|e| e.model.clone()),
             priority,
+            protocol: Protocol::Feature,
+            keyboard: false,
         });
     }
     out.sort_by_key(|c| (c.priority, c.vid, c.pid, c.interface));
@@ -265,15 +318,24 @@ fn try_read(
 
 /// 打开某个候选接口并读取电量。
 ///
-/// 组合优先级：65 字节取反帧 → 21 字节取反帧 → 两种原样帧。
-/// 只要有一个组合返回合法身份（vid != 0 且电量 0..=100）就立即返回。
+/// 按接口所属协议分派：迈从走 Feature Report，狼蛛走中断报告。
 pub fn read_battery(api: &HidApi, c: &Candidate) -> Result<Reading, String> {
     let dev = api
         .open_path(&c.path)
         .map_err(|e| format!("打开接口失败：{e}"))?;
-    dev.set_blocking_mode(true)
-        .map_err(|e| format!("设置阻塞模式失败：{e}"))?;
+    match c.protocol {
+        Protocol::Feature => {
+            dev.set_blocking_mode(true)
+                .map_err(|e| format!("设置阻塞模式失败：{e}"))?;
+            read_feature(&dev, c)
+        }
+        Protocol::AulaRaw => read_aula(&dev, c),
+    }
+}
 
+/// 迈从：组合优先级 65 字节取反帧 → 21 字节取反帧 → 两种原样帧。
+/// 只要有一个组合返回合法身份（vid != 0 且电量 0..=100）就立即返回。
+fn read_feature(dev: &HidDevice, c: &Candidate) -> Result<Reading, String> {
     let combos = [
         (true, FEATURE_LEN_NATIVE),
         (true, FEATURE_LEN_COMPAT),
@@ -282,7 +344,7 @@ pub fn read_battery(api: &HidApi, c: &Candidate) -> Result<Reading, String> {
     ];
     let mut errors = Vec::new();
     for (inverted, len) in combos {
-        match try_read(&dev, REPORT_SHORT, inverted, len) {
+        match try_read(dev, REPORT_SHORT, inverted, len) {
             Ok(mut r) => {
                 r.label = format!("{} | RAW {}", c.label(), r.label);
                 return Ok(r);
@@ -291,6 +353,77 @@ pub fn read_battery(api: &HidApi, c: &Candidate) -> Result<Reading, String> {
         }
     }
     Err(errors.join("；"))
+}
+
+/// 解析狼蛛应答帧。帧头可能带 Report ID，所以两种起点都接受。
+///
+/// ```text
+/// 20 01 00 64 … 85     pos=0，电量 = d[pos + 3]
+/// 00 20 01 00 64 …     pos=1（hidapi 未剥掉 Report ID 时）
+/// ```
+pub fn parse_aula(d: &[u8]) -> Option<u8> {
+    let pos = if d.len() >= 4 && d[0] == AULA_CMD[0] && d[1] == AULA_CMD[1] {
+        0
+    } else if d.len() >= 5 && d[1] == AULA_CMD[0] && d[2] == AULA_CMD[1] {
+        1
+    } else {
+        return None;
+    };
+    let battery = *d.get(pos + 3)?;
+    if battery > 100 {
+        return None;
+    }
+    // 末字节是前面所有字节之和；帧长不足时跳过校验（不同接口长度不同）。
+    if pos == 0 && d.len() >= AULA_REPORT_LEN {
+        let sum = d[..d.len() - 1]
+            .iter()
+            .fold(0u8, |acc, b| acc.wrapping_add(*b));
+        if sum != d[d.len() - 1] {
+            return None;
+        }
+    }
+    Some(battery)
+}
+
+/// 狼蛛：写 33 字节查询帧，再读中断输入报告。
+fn read_aula(dev: &HidDevice, c: &Candidate) -> Result<Reading, String> {
+    // [Report ID 0x00] [20 01] [00] 其余填充
+    let mut frame = vec![0u8; AULA_REPORT_LEN];
+    frame[1] = AULA_CMD[0];
+    frame[2] = AULA_CMD[1];
+
+    let mut last_raw = String::new();
+    for attempt in 0..6 {
+        // 丢掉可能积压的上报，避免把上一轮的应答当成本次结果。
+        let mut junk = [0u8; 64];
+        while dev.read_timeout(&mut junk, 10).unwrap_or(0) > 0 {}
+
+        dev.write(&frame)
+            .map_err(|e| format!("发送电量查询失败：{e}"))?;
+        thread::sleep(Duration::from_millis(30));
+
+        let mut buf = [0u8; AULA_REPORT_LEN];
+        let n = dev.read_timeout(&mut buf, 600).unwrap_or(0);
+        if n >= 4 {
+            last_raw = hex(&buf[..n.min(16)]);
+            if let Some(battery) = parse_aula(&buf[..n]) {
+                return Ok(Reading {
+                    vid: c.vid,
+                    pid: c.pid,
+                    firmware: 0,
+                    flags: 0,
+                    battery,
+                    // 该协议只回电量，没有充电位。
+                    charging: 0,
+                    inverted: false,
+                    frame_len: AULA_REPORT_LEN,
+                    label: format!("{} | RAW {}", c.label(), last_raw),
+                });
+            }
+        }
+        thread::sleep(Duration::from_millis(40 + 40 * attempt as u64));
+    }
+    Err(format!("狼蛛查询 6 次后仍无有效应答（最后一帧：{last_raw}）"))
 }
 
 /// 诊断输出：列出候选接口，并对每个接口打印原始 Feature Report。
@@ -309,6 +442,42 @@ pub fn dump_candidates(extra: &[ExtraDevice]) -> String {
             c.path.to_string_lossy(),
             if c.serial.is_empty() { "-" } else { c.serial.as_str() }
         ));
+
+        // 狼蛛只有中断报告，Feature Report 会直接报错，单独走一遍查询。
+        if c.protocol == Protocol::AulaRaw {
+            match api.open_path(&c.path) {
+                Ok(dev) => {
+                    let mut frame = vec![0u8; AULA_REPORT_LEN];
+                    frame[1] = AULA_CMD[0];
+                    frame[2] = AULA_CMD[1];
+                    match dev.write(&frame) {
+                        Ok(_) => {
+                            thread::sleep(Duration::from_millis(40));
+                            let mut rsp = [0u8; AULA_REPORT_LEN];
+                            match dev.read_timeout(&mut rsp, 600) {
+                                Ok(n) if n >= 4 => {
+                                    s.push_str(&format!(
+                                        "  查询帧：{}\n  应答：{}\n",
+                                        hex(&frame[..4]),
+                                        hex(&rsp[..n.min(20)])
+                                    ));
+                                    match parse_aula(&rsp[..n]) {
+                                        Some(b) => s.push_str(&format!("  解析：电量={b}%\n")),
+                                        None => s.push_str("  解析：帧头或校验不匹配\n"),
+                                    }
+                                }
+                                Ok(_) => s.push_str("  无应答\n"),
+                                Err(e) => s.push_str(&format!("  读取失败：{e}\n")),
+                            }
+                        }
+                        Err(e) => s.push_str(&format!("  发送失败：{e}\n")),
+                    }
+                }
+                Err(e) => s.push_str(&format!("  打开失败：{e}\n")),
+            }
+            continue;
+        }
+
         match api.open_path(&c.path) {
             Ok(dev) => {
                 for len in [FEATURE_LEN_NATIVE, FEATURE_LEN_COMPAT] {

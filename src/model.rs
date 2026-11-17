@@ -166,7 +166,11 @@ fn display_for(c: &Candidate) -> (String, String, DeviceKind) {
             c.display_model
                 .clone()
                 .unwrap_or_else(|| format!("{:04X}:{:04X} · 2.4G", c.vid, c.pid)),
-            DeviceKind::Mouse,
+            if c.keyboard {
+                DeviceKind::Keyboard
+            } else {
+                DeviceKind::Mouse
+            },
         );
     }
     let upper = c.product.to_uppercase();
@@ -234,17 +238,8 @@ fn poll_devices(cfg: &Config) -> Snapshot {
                     r.battery,
                     r.charging
                 ));
-                devices.push(DeviceState {
-                    key: c.key(),
-                    name,
-                    model,
-                    kind,
-                    battery: Some(r.battery),
-                    // 状态值约定：2=放电，4=满电，3=充电中。
-                    charging: r.charging != 0 && r.charging != 2 && r.charging != 4,
-                    connected: true,
-                    last_seen: Some(Local::now()),
-                    detail: format!(
+                let detail = match c.protocol {
+                    hid::Protocol::Feature => format!(
                         "接口 {:04X}:{:04X} · 无线设备 {:04X}:{:04X}\n固件 u32={} · 标志 0x{:02X}\n报告 0x11/0x06 · 帧长 {}B · 载荷取反={}\n{}",
                         c.vid,
                         c.pid,
@@ -256,6 +251,22 @@ fn poll_devices(cfg: &Config) -> Snapshot {
                         r.inverted,
                         r.label
                     ),
+                    hid::Protocol::AulaRaw => format!(
+                        "接口 {:04X}:{:04X} · 狼蛛 2.4G 接收器\n查询帧 20 01 · 报文 {}B · 中断报告应答\n{}",
+                        c.vid, c.pid, r.frame_len, r.label
+                    ),
+                };
+                devices.push(DeviceState {
+                    key: c.key(),
+                    name,
+                    model,
+                    kind,
+                    battery: Some(r.battery),
+                    // 状态值约定：2=放电，4=满电，3=充电中。
+                    charging: r.charging != 0 && r.charging != 2 && r.charging != 4,
+                    connected: true,
+                    last_seen: Some(Local::now()),
+                    detail,
                 });
             }
             Err(e) => notes.push(format!("--  {} → {e}", c.label())),
@@ -264,7 +275,7 @@ fn poll_devices(cfg: &Config) -> Snapshot {
 
     if devices.is_empty() {
         let reason = if candidates.is_empty() {
-            "未发现 2.4G 接收器（VID 5253 / 3837，UsagePage FF01/FF0B）".to_string()
+            "未发现 2.4G 接收器（迈从 5253/3837、狼蛛 05AC:024F）".to_string()
         } else {
             "接收器已发现，但设备未响应电量查询（可能已关机 / 休眠 / 被厂商驱动占用）"
                 .to_string()

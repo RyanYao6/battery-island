@@ -4,7 +4,8 @@
 //! 电量岛 —— 2.4G 无线外设电量小工具
 //!
 //! Rust + egui，Windows 托盘常驻。默认读取迈从 MCHOSE L7 Pro 2.4G 接收器
-//! 的 Feature Report（详见 src/hid.rs 顶部的协议来源说明）。
+//! 的 Feature Report；狼蛛 AULA F98 Pro 走 2.4G 接收器的中断报告查询。
+//! 两套协议的报文格式见 src/hid.rs 顶部说明。
 //!
 //! 命令行：
 //!   battery-island.exe              正常运行（托盘常驻）
@@ -193,17 +194,25 @@ fn probe_battery(cfg: &Config) -> String {
     };
     let list = hid::find_candidates(&api, &cfg.extra_devices);
     out.push_str(&format!("候选接口：{} 个\n", list.len()));
+    // 同一接收器会枚举出多个集合，某个读成功后其余集合不必再试。
+    let mut done = std::collections::HashSet::new();
     for c in &list {
+        if done.contains(&(c.vid, c.pid)) {
+            continue;
+        }
         out.push_str(&format!("\n接口 {}\n", c.label()));
         match hid::read_battery(&api, c) {
-            Ok(r) => out.push_str(&format!(
-                "  读取成功：电量 {}%  充电原始值 {}\n  vid={:04X} pid={:04X} 固件={} 标志=0x{:02X} 帧长={}B 载荷取反={}\n  响应帧：{}\n",
-                r.battery, r.charging, r.vid, r.pid, r.firmware, r.flags, r.frame_len, r.inverted, r.label
-            )),
+            Ok(r) => {
+                done.insert((c.vid, c.pid));
+                out.push_str(&format!(
+                    "  读取成功：电量 {}%  充电原始值 {}\n  协议={:?} vid={:04X} pid={:04X} 固件={} 标志=0x{:02X} 帧长={}B 载荷取反={}\n  响应帧：{}\n",
+                    r.battery, r.charging, c.protocol, r.vid, r.pid, r.firmware, r.flags, r.frame_len, r.inverted, r.label
+                ));
+            }
             Err(e) => out.push_str(&format!("  读取失败：{e}\n")),
         }
     }
-    out.push_str("\n===== 原始 Feature Report（单次，无重试）=====\n");
+    out.push_str("\n===== 原始报告（单次，无重试）=====\n");
     out.push_str(&hid::dump_candidates(&cfg.extra_devices));
     out
 }
@@ -268,7 +277,7 @@ fn print_help() {
     let text = "电量岛 · 2.4G 无线外设电量小工具\n\n\
         --demo    界面预览（示例数据，不访问硬件）\n\
         --read    实机读取一次电量，结果写入 battery-island-reading.txt\n\
-        --dump    导出 HID 候选接口与原始 Feature Report 到 battery-island-dump.txt\n\
+        --dump    导出 HID 候选接口与原始报告到 battery-island-dump.txt\n\
         --help    显示本帮助\n\n\
         配置文件：程序同目录 config.toml\n\
         日志：%LOCALAPPDATA%\\BatteryIsland\\app.log\n";
