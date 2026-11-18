@@ -47,6 +47,18 @@ fn bold(size: f32) -> FontId {
     FontId::new(size, egui::FontFamily::Name("Bold".into()))
 }
 
+/// 隐藏面板时把窗口挪到屏幕外，而不是 `Visible(false)`。
+///
+/// 窗口只在启动时 `Visible(true)` 一次，此后常驻「已显示」状态。这样 winit
+/// 不会在每次 ShowWindow 时把 WS_CAPTION | WS_BORDER 写回来，也不会在 egui
+/// 还没绘制第一帧时先合成一个带标题栏的白色系统窗口——那就是托盘弹出时
+/// 肉眼看到的「闪一下」。
+fn place_offscreen(ctx: &Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(
+        -32000.0, -32000.0,
+    )));
+}
+
 /// 把时间差写成「刚刚 / N 秒前 / N 分钟前」，比固定时钟更直观。
 fn human_ago(t: &chrono::DateTime<chrono::Local>) -> String {
     let secs = (chrono::Local::now() - *t).num_seconds().max(0);
@@ -162,7 +174,7 @@ impl BatteryApp {
         self.was_focused = false;
         // 收起后下次打开回到设备页，避免一开面板就停在设置里。
         self.page = Page::Devices;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        place_offscreen(ctx);
     }
 
     fn set_page(&mut self, ctx: &Context, page: Page) {
@@ -197,19 +209,13 @@ impl BatteryApp {
             Page::Settings => metrics::SETTINGS_H,
             Page::Devices => window_height(self.snapshot.devices.len()),
         };
-        // 隐藏期间改过的高度不一定被 winit 接受，这里无条件重发一次。
-        self.apply_size(ctx, target_h, true);
+        // 窗口常驻可见后尺寸变更都会生效，只有高度真的不同才重发，
+        // 避免每次弹出都触发一次无谓的窗口重设（会闪）。
+        self.apply_size(ctx, target_h, false);
 
-        // 必须先定位、再显示。反过来窗口会先在旧位置露出一帧；透明窗口
-        // 不会自动擦除旧画面，屏幕上就会留下「两个重叠面板」的残影。
+        // 窗口一直处于显示状态，这里只需要把它从屏幕外挪回来。
         self.place(ctx);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        // ShowWindow 之后 winit 可能把 WS_CAPTION | WS_BORDER 写回来，客户区
-        // 因此整体偏移、底栏被裁。补几次样式与圆角修正，每次显示都要排。
-        let now = std::time::Instant::now();
-        self.restyle_queue.push(now + Duration::from_millis(120));
-        self.restyle_queue.push(now + Duration::from_millis(420));
         ctx.request_repaint();
     }
 
@@ -626,9 +632,17 @@ impl eframe::App for BatteryApp {
                 // 触发一次尺寸同步，让渲染表面按新客户区重建。
                 let h = self.current_h;
                 self.apply_size(ctx, h, true);
+                // 整个进程只在这里 Visible(true) 一次；之后收起面板只是把窗口
+                // 挪到屏幕外，窗口本身一直可见、一直有已渲染好的画面。
                 if self.cfg.show_on_start {
-                    self.show(ctx, None);
+                    self.place(ctx);
+                } else {
+                    place_offscreen(ctx);
                 }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                // 首次 ShowWindow 后 winit 可能回写边框样式，稍后补修一次。
+                self.restyle_queue
+                    .push(std::time::Instant::now() + Duration::from_millis(120));
                 ctx.request_repaint();
             }
             let now = std::time::Instant::now();

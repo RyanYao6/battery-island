@@ -261,9 +261,9 @@ pub fn work_area() -> (f32, f32, f32, f32) {
 #[cfg(windows)]
 fn make_popup_window(hwnd: windows_sys::Win32::Foundation::HWND) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
-        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_BORDER, WS_CAPTION, WS_POPUP, WS_SYSMENU,
-        WS_THICKFRAME,
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
+        SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_BORDER, WS_CAPTION,
+        WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
     };
 
     unsafe {
@@ -273,10 +273,21 @@ fn make_popup_window(hwnd: windows_sys::Win32::Foundation::HWND) {
         // 显示时容易出现整块内容偏移。
         let decor = WS_CAPTION | WS_BORDER | WS_THICKFRAME | WS_SYSMENU;
         let new_style = (style & !decor) | WS_POPUP;
-        if new_style == style {
+
+        // 窗口现在常驻可见（隐藏时只是移到屏幕外），必须显式声明为工具窗口，
+        // 否则会冒到任务栏和 Alt-Tab 里。
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let new_ex = (ex & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW;
+
+        if new_style == style && new_ex == ex {
             return;
         }
-        SetWindowLongPtrW(hwnd, GWL_STYLE, new_style as isize);
+        if new_style != style {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, new_style as isize);
+        }
+        if new_ex != ex {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
+        }
         // 让系统按新样式重算非客户区，否则旧边框仍会残留一帧。
         SetWindowPos(
             hwnd,
@@ -297,10 +308,11 @@ fn make_popup_window(hwnd: windows_sys::Win32::Foundation::HWND) {
 pub fn apply_round_region(width: i32, height: i32) {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::Graphics::Gdi::{
-        CreateRoundRectRgn, RedrawWindow, SetWindowRgn, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME,
-        RDW_INVALIDATE, RDW_UPDATENOW,
+        CreateRoundRectRgn, RedrawWindow, SetWindowRgn, RDW_ALLCHILDREN, RDW_INVALIDATE,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, GetClientRect};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_REGION: AtomicU64 = AtomicU64::new(0);
 
     unsafe {
         let title: Vec<u16> = "电量岛\0".encode_utf16().collect();
@@ -323,22 +335,28 @@ pub fn apply_round_region(width: i32, height: i32) {
         } else {
             (width, height)
         };
-        // 区域从第 1 行起裁：系统会在窗口最顶端留一条 1px 边框线，
-        // 它位于 egui 可绘制区之外，只能靠窗口区域切掉。bottom 用 h+1
-        // 让区域一直覆盖到客户区最后一行（参数是排他的）。
-        let rgn = CreateRoundRectRgn(0, 1, w, h + 1, 24, 24);
-        if !rgn.is_null() {
-            // SetWindowRgn 成功后系统接管 HRGN，不要 DeleteObject。
-            let ok = SetWindowRgn(hwnd, rgn, 1);
-            log_line(&format!("窗口圆角区域：{w}x{h} ret={ok}"));
+        // 尺寸没变就不要重复 SetWindowRgn：窗口现在常驻可见，重复设置区域
+        // 会触发一次无谓重绘，看起来就是弹出时「闪一下」。
+        let key = ((w as u64) << 32) | (h as u64);
+        if LAST_REGION.swap(key, Ordering::Relaxed) != key {
+            // 区域从第 1 行起裁：系统会在窗口最顶端留一条 1px 边框线，
+            // 它位于 egui 可绘制区之外，只能靠窗口区域切掉。bottom 用 h+1
+            // 让区域一直覆盖到客户区最后一行（参数是排他的）。
+            let rgn = CreateRoundRectRgn(0, 1, w, h + 1, 24, 24);
+            if !rgn.is_null() {
+                // SetWindowRgn 成功后系统接管 HRGN，不要 DeleteObject。
+                let ok = SetWindowRgn(hwnd, rgn, 1);
+                log_line(&format!("窗口圆角区域：{w}x{h} ret={ok}"));
+            }
+            // 只做异步失效，不带 RDW_ERASE / RDW_UPDATENOW：同步强制擦除会在
+            // 窗口可见时涂一次背景，正好造成一次肉眼可见的闪烁。
+            RedrawWindow(
+                hwnd,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                RDW_INVALIDATE | RDW_ALLCHILDREN,
+            );
         }
-        // 透明窗口移动后系统不会自动擦除旧位置的画面，显式全量重绘消掉残影。
-        RedrawWindow(
-            hwnd,
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
-        );
     }
 }
 
