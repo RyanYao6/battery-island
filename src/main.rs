@@ -261,13 +261,22 @@ pub fn work_area() -> (f32, f32, f32, f32) {
 #[cfg(windows)]
 fn make_popup_window(hwnd: windows_sys::Win32::Foundation::HWND) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE,
-        SWP_NOZORDER, WS_POPUP, WS_VISIBLE,
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_BORDER, WS_CAPTION, WS_POPUP, WS_SYSMENU,
+        WS_THICKFRAME,
     };
 
     unsafe {
-        let style = (WS_POPUP | WS_VISIBLE) as isize;
-        SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        // 只清掉会引入非客户区的样式位。以前直接强写 WS_POPUP | WS_VISIBLE，
+        // 会把 winit 设置的其它样式（含 layered / clipped）一起抹掉，窗口再次
+        // 显示时容易出现整块内容偏移。
+        let decor = WS_CAPTION | WS_BORDER | WS_THICKFRAME | WS_SYSMENU;
+        let new_style = (style & !decor) | WS_POPUP;
+        if new_style == style {
+            return;
+        }
+        SetWindowLongPtrW(hwnd, GWL_STYLE, new_style as isize);
         // 让系统按新样式重算非客户区，否则旧边框仍会残留一帧。
         SetWindowPos(
             hwnd,
@@ -286,8 +295,12 @@ fn make_popup_window(hwnd: windows_sys::Win32::Foundation::HWND) {
 /// 改由系统裁切窗口形状最可靠，也不依赖 Windows 11 的 DWM 圆角属性。
 #[cfg(windows)]
 pub fn apply_round_region(width: i32, height: i32) {
-    use windows_sys::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
-    use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW;
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateRoundRectRgn, RedrawWindow, SetWindowRgn, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME,
+        RDW_INVALIDATE, RDW_UPDATENOW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, GetClientRect};
 
     unsafe {
         let title: Vec<u16> = "电量岛\0".encode_utf16().collect();
@@ -296,14 +309,36 @@ pub fn apply_round_region(width: i32, height: i32) {
             return;
         }
         make_popup_window(hwnd);
+
+        // 用真实客户区尺寸裁圆角。InnerSize 是异步生效的，按目标高度裁会在
+        // 窗口还没变高时把底栏切掉；按旧高度裁则会在变高后留下直角黑边。
+        let mut r = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let (w, h) = if GetClientRect(hwnd, &mut r) != 0 && r.right > 0 && r.bottom > 0 {
+            (r.right, r.bottom)
+        } else {
+            (width, height)
+        };
         // 区域从第 1 行起裁：系统会在窗口最顶端留一条 1px 边框线，
-        // 它位于 egui 可绘制区之外，只能靠窗口区域切掉。
-        let rgn = CreateRoundRectRgn(0, 1, width, height, 24, 24);
+        // 它位于 egui 可绘制区之外，只能靠窗口区域切掉。bottom 用 h+1
+        // 让区域一直覆盖到客户区最后一行（参数是排他的）。
+        let rgn = CreateRoundRectRgn(0, 1, w, h + 1, 24, 24);
         if !rgn.is_null() {
             // SetWindowRgn 成功后系统接管 HRGN，不要 DeleteObject。
             let ok = SetWindowRgn(hwnd, rgn, 1);
-            log_line(&format!("窗口圆角区域：{width}x{height} ret={ok}"));
+            log_line(&format!("窗口圆角区域：{w}x{h} ret={ok}"));
         }
+        // 透明窗口移动后系统不会自动擦除旧位置的画面，显式全量重绘消掉残影。
+        RedrawWindow(
+            hwnd,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        );
     }
 }
 

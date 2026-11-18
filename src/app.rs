@@ -96,14 +96,12 @@ pub struct BatteryApp {
     current_h: f32,
     toast: String,
     toast_at: Option<std::time::Instant>,
-    /// 显示位置锚点（托盘点击的物理坐标）；None 表示放在工作区右下角。
-    anchor: Option<(f32, f32)>,
     /// 已经下发给窗口的高度。隐藏期间改高度可能不生效，重新显示时要按它校验。
     applied_h: f32,
     /// 首帧是否已完成「先改窗口样式、再显示」的初始化。
     booted: bool,
-    /// 显示后再补一次样式修正，避免 winit 在显示时把边框加回来。
-    restyle_at: Option<std::time::Instant>,
+    /// 每次显示后都要补几次样式修正：winit 在 ShowWindow 时会把边框样式加回来。
+    restyle_queue: Vec<std::time::Instant>,
     last_tray_click: Option<std::time::Instant>,
 }
 
@@ -140,10 +138,9 @@ impl BatteryApp {
             toast: String::new(),
             toast_at: None,
             last_tray_click: None,
-            anchor: None,
             applied_h: 0.0,
             booted: false,
-            restyle_at: None,
+            restyle_queue: Vec::new(),
         }
     }
 
@@ -189,11 +186,10 @@ impl BatteryApp {
         ctx.request_repaint();
     }
 
-    fn show(&mut self, ctx: &Context, at: Option<(f64, f64)>) {
+    fn show(&mut self, ctx: &Context, _at: Option<(f64, f64)>) {
         self.visible = true;
         // 重新显示时先不认为「曾经获得焦点」，否则会被失焦自动隐藏立刻收起。
         self.was_focused = false;
-        self.anchor = at.map(|(x, y)| (x as f32, y as f32));
 
         // 收起时页面会回到设备页，但窗口高度可能还停在设置页的 432，
         // 直接用旧高度弹出来就会多出一大块空白，所以显示前先按当前页面复位。
@@ -204,35 +200,29 @@ impl BatteryApp {
         // 隐藏期间改过的高度不一定被 winit 接受，这里无条件重发一次。
         self.apply_size(ctx, target_h, true);
 
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        // 必须先定位、再显示。反过来窗口会先在旧位置露出一帧；透明窗口
+        // 不会自动擦除旧画面，屏幕上就会留下「两个重叠面板」的残影。
         self.place(ctx);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        // ShowWindow 之后 winit 可能把 WS_CAPTION | WS_BORDER 写回来，客户区
+        // 因此整体偏移、底栏被裁。补几次样式与圆角修正，每次显示都要排。
+        let now = std::time::Instant::now();
+        self.restyle_queue.push(now + Duration::from_millis(120));
+        self.restyle_queue.push(now + Duration::from_millis(420));
         ctx.request_repaint();
     }
 
-    /// 按锚点 / 工作区右下角摆放窗口，并夹在任务栏之外的可见区域内。
+    /// 固定贴工作区右下角。
+    ///
+    /// 旧实现按托盘点击坐标算 `x - 宽 + 46`：图标落进「隐藏图标」溢出区时
+    /// 面板会整体左移一百多像素，与首次启动的右下角不一致；窗口移动又会在
+    /// 透明窗口上留下旧位置的残影。统一到右下角后每次弹出位置都相同。
     fn place(&self, ctx: &Context) {
         let h = self.current_h;
         let (wl, wt, wr, wb) = work_area_logical(ctx);
-        let (left, top) = match self.anchor {
-            Some((ax, ay)) => {
-                let ppp = ctx.pixels_per_point().max(1.0);
-                let (px, py) = (ax / ppp, ay / ppp);
-                let left =
-                    (px - WINDOW_W + 46.0).clamp(wl + 8.0, (wr - WINDOW_W - 8.0).max(wl + 8.0));
-                // 托盘通常贴在屏幕底部：优先向上弹出，上方放不下再改为向下。
-                let above = py - h - 14.0;
-                let top = if above >= wt + 8.0 { above } else { py + 14.0 };
-                (
-                    left,
-                    top.clamp(wt + 8.0, (wb - h - 8.0).max(wt + 8.0)),
-                )
-            }
-            None => (
-                (wr - WINDOW_W - 12.0).max(wl + 8.0),
-                (wb - h - 12.0).max(wt + 8.0),
-            ),
-        };
+        let left = (wr - WINDOW_W - 12.0).max(wl + 8.0);
+        let top = (wb - h - 12.0).max(wt + 8.0);
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(left, top)));
     }
 
@@ -639,12 +629,11 @@ impl eframe::App for BatteryApp {
                 if self.cfg.show_on_start {
                     self.show(ctx, None);
                 }
-                // 显示动作由 winit 异步处理，可能把边框样式加回来，稍后再修一次。
-                self.restyle_at = Some(std::time::Instant::now() + Duration::from_millis(260));
                 ctx.request_repaint();
             }
-            if self.restyle_at.map(|t| std::time::Instant::now() >= t).unwrap_or(false) {
-                self.restyle_at = None;
+            let now = std::time::Instant::now();
+            if self.restyle_queue.iter().any(|t| now >= *t) {
+                self.restyle_queue.retain(|t| now < *t);
                 crate::apply_round_region(WINDOW_W as i32, self.current_h as i32);
             }
         }
