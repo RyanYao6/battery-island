@@ -7,12 +7,15 @@ pub mod metrics {
     pub const WINDOW_W: f32 = 392.0;
     /// 圆角面板与窗口边缘之间的透明留白
     pub const SHELL_INSET: f32 = 8.0;
+    /// 窗口顶部预留给系统的条带：winit 在窗口激活瞬间会把 WS_CAPTION 写回，
+    /// 系统会在这一带画标题栏。窗口区域从这里开始裁，用户永远看不到它。
+    pub const TOP_TRIM: f32 = 22.0;
     pub const PAD: f32 = 16.0;
     pub const HEADER_H: f32 = 56.0;
     pub const CARD_H: f32 = 92.0;
     pub const CARD_GAP: f32 = 10.0;
     pub const FOOTER_H: f32 = 44.0;
-    pub const SETTINGS_H: f32 = 432.0;
+    pub const SETTINGS_H: f32 = 454.0;
     /// 顶栏与第一张卡片之间
     pub const HEADER_GAP: f32 = 10.0;
     /// 最后一张卡片与底栏之间

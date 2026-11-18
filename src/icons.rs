@@ -105,6 +105,14 @@ pub fn sliders(p: &Painter, c: Pos2, color: Color32) {
     }
 }
 
+/// 返回箭头（设置页左上角）。
+pub fn back(p: &Painter, c: Pos2, color: Color32) {
+    let s = Stroke::new(1.9, color);
+    p.line_segment([Pos2::new(c.x + 5.0, c.y), Pos2::new(c.x - 5.0, c.y)], s);
+    p.line_segment([Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x - 1.0, c.y - 4.0)], s);
+    p.line_segment([Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x - 1.0, c.y + 4.0)], s);
+}
+
 pub fn close(p: &Painter, c: Pos2, color: Color32) {
     let s = Stroke::new(1.7, color);
     p.line_segment([Pos2::new(c.x - 5.0, c.y - 5.0), Pos2::new(c.x + 5.0, c.y + 5.0)], s);
@@ -164,70 +172,86 @@ impl Canvas {
         self.data[i + 3] = self.data[i + 3].max(c[3]);
     }
 
-    fn fill(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, c: [u8; 4]) {
+    /// 真正的圆角矩形填充，替代以前「画方框再手动抠掉几个角像素」的做法。
+    fn round_rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, r: i32, c: [u8; 4]) {
+        let r = r.max(0).min((x1 - x0) / 2).min((y1 - y0) / 2);
         for y in y0..y1 {
             for x in x0..x1 {
-                self.px(x, y, c);
+                let dx = if x < x0 + r {
+                    x0 + r - x
+                } else if x >= x1 - r {
+                    x - (x1 - r - 1)
+                } else {
+                    0
+                };
+                let dy = if y < y0 + r {
+                    y0 + r - y
+                } else if y >= y1 - r {
+                    y - (y1 - r - 1)
+                } else {
+                    0
+                };
+                if dx * dx + dy * dy <= r * r {
+                    self.px(x, y, c);
+                }
             }
         }
-    }
-
-    fn frame(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, t: i32, c: [u8; 4]) {
-        self.fill(x0, y0, x1, y0 + t, c);
-        self.fill(x0, y1 - t, x1, y1, c);
-        self.fill(x0, y0, x0 + t, y1, c);
-        self.fill(x1 - t, y0, x1, y1, c);
     }
 }
 
 fn battery_color(p: u8) -> [u8; 4] {
     if p < 20 {
-        [226, 78, 66, 255]
+        [233, 84, 74, 255]
     } else if p < 40 {
-        [235, 152, 48, 255]
+        [240, 160, 56, 255]
     } else {
-        [16, 150, 110, 255]
+        [26, 166, 120, 255]
     }
 }
 
 /// 生成电池托盘图标（RGBA）。坐标以 32px 为基准等比缩放，
 /// 高 DPI 下用 64px 生成比让系统放大 32px 清晰得多。
+///
+/// 扁平圆角造型：中蓝灰外壳在深色 / 浅色任务栏上都有对比，近白内底避免
+/// 透明挖空在深色背景上变成黑洞；电量用整块颜色表示，不放刻度碎线。
 pub fn tray_rgba(percent: Option<u8>, size: i32) -> Vec<u8> {
     let size = size.max(16);
     let k = size as f32 / 32.0;
     let s = |v: f32| (v * k).round() as i32;
-    let t = ((2.0 * k).round() as i32).max(1);
 
     let mut c = Canvas::new(size, size);
-    let shell = [236, 240, 242, 255];
-    let outline = [70, 82, 92, 255];
+    let rim = [126, 140, 158, 255];
+    let inner = [252, 253, 255, 255];
 
     // 正极帽
-    c.fill(s(26.0), s(12.0), s(30.0), s(20.0), outline);
-    // 电池外壳
-    c.fill(s(2.0), s(6.0), s(27.0), s(26.0), shell);
-    c.frame(s(2.0), s(6.0), s(27.0), s(26.0), t, outline);
-    // 挖空内部
-    c.fill(s(5.0), s(9.0), s(24.0), s(23.0), [0, 0, 0, 0]);
-    // 四角微调，模拟圆角
-    for (x, y) in [
-        (2.0, 6.0), (3.0, 6.0), (2.0, 7.0),
-        (26.0, 6.0), (25.0, 6.0), (26.0, 7.0),
-        (2.0, 25.0), (3.0, 25.0), (2.0, 24.0),
-        (26.0, 25.0), (25.0, 25.0), (26.0, 24.0),
-    ] {
-        c.px(s(x), s(y), [0, 0, 0, 0]);
-    }
+    c.round_rect(s(27.0), s(12.0), s(31.0), s(20.0), s(1.6).max(1), rim);
+    // 外壳
+    c.round_rect(s(1.0), s(6.0), s(28.0), s(26.0), s(5.5), rim);
+    // 内底：留出一圈均匀边框
+    c.round_rect(s(3.5), s(8.5), s(25.5), s(23.5), s(3.5), inner);
 
-    if let Some(p) = percent {
-        let p = p.min(100);
-        let fill_w = (17.0 * k * p as f32 / 100.0).round() as i32;
-        if fill_w > 0 {
-            c.fill(s(5.0), s(9.0), s(5.0) + fill_w, s(23.0), battery_color(p));
+    match percent {
+        None => {
+            // 未读到设备：居中的浅灰状态点，不用横杠以免被误读成 0%
+            let (cx, cy, r) = (s(14.5), s(16.0), s(3.0).max(1));
+            for y in (cy - r)..=(cy + r) {
+                for x in (cx - r)..=(cx + r) {
+                    if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r {
+                        c.px(x, y, [190, 199, 210, 255]);
+                    }
+                }
+            }
         }
-        // 白色分隔刻度
-        c.fill(s(13.0), s(9.0), s(14.0), s(23.0), [255, 255, 255, 90]);
-        c.fill(s(19.0), s(9.0), s(20.0), s(23.0), [255, 255, 255, 90]);
+        Some(p) => {
+            let p = p.min(100);
+            let x0 = s(4.5);
+            let w = s(24.5) - x0;
+            let fw = (w as f32 * p as f32 / 100.0).round() as i32;
+            if fw > 0 {
+                let r = s(3.0).min(fw / 2).max(0);
+                c.round_rect(x0, s(9.5), x0 + fw, s(22.5), r, battery_color(p));
+            }
+        }
     }
     c.data
 }

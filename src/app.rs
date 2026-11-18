@@ -31,7 +31,8 @@ fn work_area_logical(ctx: &Context) -> (f32, f32, f32, f32) {
 /// 按设备数量计算面板高度：单设备时尽量紧凑。
 pub fn window_height(count: usize) -> f32 {
     let n = count.clamp(1, MAX_CARDS) as f32;
-    metrics::SHELL_INSET * 2.0
+    metrics::TOP_TRIM
+        + metrics::SHELL_INSET * 2.0
         + metrics::HEADER_H
         + metrics::HEADER_GAP
         + n * metrics::CARD_H
@@ -114,6 +115,8 @@ pub struct BatteryApp {
     booted: bool,
     /// 每次显示后都要补几次样式修正：winit 在 ShowWindow 时会把边框样式加回来。
     restyle_queue: Vec<std::time::Instant>,
+    /// 启动时先在屏幕外显示，等 egui 画完首帧再挪回可见位置，避免首帧白窗。
+    pending_reveal: bool,
     last_tray_click: Option<std::time::Instant>,
 }
 
@@ -153,6 +156,7 @@ impl BatteryApp {
             applied_h: 0.0,
             booted: false,
             restyle_queue: Vec::new(),
+            pending_reveal: false,
         }
     }
 
@@ -194,7 +198,13 @@ impl BatteryApp {
         self.theme = crate::theme::resolve(&self.theme_pref);
         crate::theme::apply_to_egui(ctx, &self.theme);
         self.cfg.theme = self.theme_pref.clone();
+        // 命令行 --demo 只影响本次运行。保存主题时把 demo / show_on_start
+        // 还原成磁盘上的值，否则预览一次界面会把配置永久改成演示模式。
+        let on_disk = Config::load();
+        self.cfg.demo = on_disk.demo;
+        self.cfg.show_on_start = on_disk.show_on_start;
         let _ = self.cfg.save();
+        self.cfg.demo = self.demo;
         ctx.request_repaint();
     }
 
@@ -511,7 +521,11 @@ impl BatteryApp {
         let t = self.theme;
         // 窗口样式已改成 WS_POPUP，客户区与窗口矩形重合，直接按 (0,0) 起绘制。
         // 最顶端 1px 由窗口区域裁掉（系统边框），所以面板从第 1 行开始可见。
-        let panel = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(WINDOW_W, self.current_h));
+        // 顶部 TOP_TRIM 是系统条带，窗口区域已从那里裁掉；面板从这里起画。
+        let panel = Rect::from_min_size(
+            Pos2::new(0.0, metrics::TOP_TRIM),
+            Vec2::new(WINDOW_W, self.current_h - metrics::TOP_TRIM),
+        );
         let p = ui.painter().with_clip_rect(panel);
         p.rect_filled(panel, corners::SHELL, t.shell);
         let full = panel;
@@ -522,48 +536,83 @@ impl BatteryApp {
         let header_cy = shell.top() + metrics::HEADER_H / 2.0 + 3.0;
 
         // ---- 顶栏 ----
+        // 设置页换成标准的「← 返回 / 标题 / × 关闭」导航条：以前复用齿轮作为
+        // 返回入口太隐晦，用户会去点 × 结果把窗口关掉。
         let logo = Rect::from_min_size(
             Pos2::new(shell.left() + metrics::PAD, shell.top() + 13.0),
             Vec2::splat(32.0),
         );
-        p.rect_filled(logo, corners::BADGE, t.card);
-        icons::logo(&p, logo.center(), t.accent);
+        let title_x = logo.right() + 10.0;
+        let right_center = Pos2::new(shell.right() - metrics::PAD - 14.0, header_cy);
 
-        p.text(
-            Pos2::new(logo.right() + 10.0, logo.top() - 2.0),
-            Align2::LEFT_TOP,
-            "电量岛",
-            bold(17.0),
-            t.text,
-        );
-        let total = self.snapshot.devices.len();
-        let online = self.snapshot.devices.iter().filter(|d| d.connected).count();
-        let subtitle = if total == 0 {
-            "正在扫描设备".to_string()
-        } else if online == 0 {
-            format!("{total} 台设备 · 均未响应")
-        } else {
-            format!("{online} / {total} 台在线")
-        };
-        p.text(
-            Pos2::new(logo.right() + 10.0, logo.top() + 21.0),
-            Align2::LEFT_TOP,
-            subtitle,
-            regular(11.0),
-            t.muted,
-        );
-
-        let gear_center = Pos2::new(shell.right() - metrics::PAD - 14.0, header_cy);
-        let close_center = Pos2::new(gear_center.x - 34.0, header_cy);
-        if self.icon_button(ui, &p, gear_center, "btn-settings", icons::sliders) {
-            let next = match self.page {
-                Page::Devices => Page::Settings,
-                Page::Settings => Page::Devices,
-            };
-            self.set_page(ctx, next);
-        }
-        if self.icon_button(ui, &p, close_center, "btn-close", icons::close) {
-            self.hide(ctx);
+        match self.page {
+            Page::Devices => {
+                p.rect_filled(logo, corners::BADGE, t.card);
+                icons::logo(&p, logo.center(), t.accent);
+                p.text(
+                    Pos2::new(title_x, logo.top() - 2.0),
+                    Align2::LEFT_TOP,
+                    "电量岛",
+                    bold(17.0),
+                    t.text,
+                );
+                let total = self.snapshot.devices.len();
+                let online = self.snapshot.devices.iter().filter(|d| d.connected).count();
+                let subtitle = if total == 0 {
+                    "正在扫描设备".to_string()
+                } else if online == 0 {
+                    format!("{total} 台设备 · 均未响应")
+                } else {
+                    format!("{online} / {total} 台在线")
+                };
+                p.text(
+                    Pos2::new(title_x, logo.top() + 21.0),
+                    Align2::LEFT_TOP,
+                    subtitle,
+                    regular(11.0),
+                    t.muted,
+                );
+                let close_center = Pos2::new(right_center.x - 34.0, header_cy);
+                if self.icon_button(ui, &p, right_center, "btn-settings", icons::sliders) {
+                    self.set_page(ctx, Page::Settings);
+                }
+                if self.icon_button(ui, &p, close_center, "btn-close", icons::close) {
+                    self.hide(ctx);
+                }
+            }
+            Page::Settings => {
+                let back = ui.interact(logo, Id::unique("btn-back"), Sense::click());
+                p.rect_filled(
+                    logo,
+                    corners::BADGE,
+                    if back.hovered() { t.hover } else { t.card },
+                );
+                icons::back(
+                    &p,
+                    logo.center(),
+                    if back.hovered() { t.text } else { t.accent },
+                );
+                if back.clicked() {
+                    self.set_page(ctx, Page::Devices);
+                }
+                p.text(
+                    Pos2::new(title_x, logo.top() - 2.0),
+                    Align2::LEFT_TOP,
+                    "设置",
+                    bold(17.0),
+                    t.text,
+                );
+                p.text(
+                    Pos2::new(title_x, logo.top() + 21.0),
+                    Align2::LEFT_TOP,
+                    "点左上角返回设备列表",
+                    regular(11.0),
+                    t.muted,
+                );
+                if self.icon_button(ui, &p, right_center, "btn-close", icons::close) {
+                    self.hide(ctx);
+                }
+            }
         }
 
         // ---- 主体 ----
@@ -625,6 +674,8 @@ impl eframe::App for BatteryApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         #[cfg(windows)]
         {
+            // 主题切换 / 窗口激活时 winit 会把边框样式写回来，每帧轻量守护一次。
+            crate::ensure_popup_style();
             if !self.booted {
                 // 窗口是隐藏创建的。趁它还没露面，先把样式改成无边框并裁好圆角，
                 // 否则用户会看到一帧系统标题栏，而且客户区会带着 8/31px 的偏移。
@@ -634,12 +685,11 @@ impl eframe::App for BatteryApp {
                 self.apply_size(ctx, h, true);
                 // 整个进程只在这里 Visible(true) 一次；之后收起面板只是把窗口
                 // 挪到屏幕外，窗口本身一直可见、一直有已渲染好的画面。
-                if self.cfg.show_on_start {
-                    self.place(ctx);
-                } else {
-                    place_offscreen(ctx);
-                }
+                // 启动这一次先显示在屏幕外，等 egui 画完首帧再挪回来，
+                // 用户就看不到系统合成的第一帧空白窗口。
+                place_offscreen(ctx);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                self.pending_reveal = self.cfg.show_on_start;
                 // 首次 ShowWindow 后 winit 可能回写边框样式，稍后补修一次。
                 self.restyle_queue
                     .push(std::time::Instant::now() + Duration::from_millis(120));
@@ -753,9 +803,19 @@ impl eframe::App for BatteryApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 渲染前再守护一次样式：winit 可能在窗口激活的这一帧刚把 WS_CAPTION
+        // 写回来，赶在本帧绘制之前修掉，系统就没机会画标题栏。
+        #[cfg(windows)]
+        crate::ensure_popup_style();
         // 不再套 CentralPanel：它会在 root Ui 里留出内边距，
         // 导致所有自绘内容整体右下偏移（实测约 (8, 31)）。
         let ctx = ui.ctx().clone();
         self.paint(ui, &ctx);
+        // 第一帧已经画进 surface，这时才把窗口从屏幕外挪回来，
+        // 用户看到的就是完整面板，不会先闪一下空白/系统窗口。
+        if self.pending_reveal {
+            self.pending_reveal = false;
+            self.place(&ctx);
+        }
     }
 }

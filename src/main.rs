@@ -251,6 +251,145 @@ pub fn work_area() -> (f32, f32, f32, f32) {
     (0.0, 0.0, 1920.0, 1080.0)
 }
 
+/// 每帧守护窗口样式：winit 在主题切换 / 焦点变化时可能把装饰位写回来。
+/// 只读一次样式，样式正确时不做任何窗口操作，不会引起重绘。
+#[cfg(windows)]
+pub fn ensure_popup_style() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE,
+        SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_BORDER, WS_CAPTION,
+        WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    };
+
+    unsafe {
+        let title: Vec<u16> = "电量岛\0".encode_utf16().collect();
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd.is_null() {
+            return;
+        }
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let decor = WS_CAPTION | WS_BORDER | WS_THICKFRAME | WS_SYSMENU;
+        if (style & decor) != 0 || (style & WS_POPUP) == 0 {
+            let new_style = (style & !decor) | WS_POPUP;
+            SetWindowLongPtrW(hwnd, GWL_STYLE, new_style as isize);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            );
+            // 系统可能已经画了一帧标题栏；用修好的样式同步重画一次非客户区，
+            // 赶在本帧合成之前把它抹掉（只在样式真的被改坏时才走这里）。
+            use windows_sys::Win32::Graphics::Gdi::{
+                RedrawWindow, RDW_ALLCHILDREN, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW,
+            };
+            RedrawWindow(
+                hwnd,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            );
+        }
+    }
+}
+
+/// 只拦 `WM_NCPAINT`：窗口激活 / 停用时系统会画一次非客户区（面板顶部那条
+/// 白横条），DWM 属性挡不住它。其它消息一律原样转发给 winit，避免干扰
+/// 窗口创建、GL 表面与输入处理。
+#[cfg(windows)]
+mod wnd {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallWindowProcW, DefWindowProcW, GWL_STYLE, STYLESTRUCT, WNDPROC, WM_NCPAINT,
+        WM_STYLECHANGING, WM_TIMER, WS_BORDER, WS_CAPTION, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    };
+
+    static ORIGINAL: AtomicIsize = AtomicIsize::new(0);
+    /// 样式守护定时器：窗口失焦时 egui 会降低帧率，不能只靠界面帧来修样式。
+    const GUARD_TIMER: usize = 0xB1A2;
+
+    unsafe extern "system" fn subclass(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_NCPAINT {
+            return 0;
+        }
+        if msg == WM_TIMER && wparam == GUARD_TIMER {
+            crate::ensure_popup_style();
+            return 0;
+        }
+        // winit 在窗口激活 / 主题切换时会把 WS_CAPTION | WS_BORDER 写回样式，
+        // 系统于是画一帧标准标题栏（左上角还能看到窗口标题）。在样式真正
+        // 生效之前拦下来，把装饰位从 styleNew 里剥掉，标题栏就无从出现。
+        if msg == WM_STYLECHANGING && (wparam as i32) == GWL_STYLE {
+            let st = lparam as *mut STYLESTRUCT;
+            if !st.is_null() {
+                let decor = WS_CAPTION | WS_BORDER | WS_THICKFRAME | WS_SYSMENU;
+                let new_style = (*st).styleNew;
+                if (new_style & decor) != 0 || (new_style & WS_POPUP) == 0 {
+                    (*st).styleNew = (new_style & !decor) | WS_POPUP;
+                }
+            }
+        }
+        let original = ORIGINAL.load(Ordering::Relaxed);
+        // 若 winit 之后重设了窗口过程，ORIGINAL 可能指回自己，避免递归。
+        if original == 0 || original == subclass as *const () as isize {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        let f: WNDPROC = std::mem::transmute(original);
+        CallWindowProcW(f, hwnd, msg, wparam, lparam)
+    }
+
+    pub unsafe fn install(hwnd: HWND) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SetTimer, SetWindowLongPtrW, GWLP_WNDPROC,
+        };
+        if ORIGINAL.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        let prev = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, subclass as *const () as isize);
+        if prev != 0 && prev != subclass as *const () as isize {
+            ORIGINAL.store(prev, Ordering::Relaxed);
+            SetTimer(hwnd, GUARD_TIMER, 16, None);
+        }
+    }
+}
+
+/// 关闭 DWM 对该窗口的非客户区渲染。
+#[cfg(windows)]
+fn disable_dwm_nc_rendering(hwnd: windows_sys::Win32::Foundation::HWND) {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
+        DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY,
+    };
+    unsafe {
+        let policy: i32 = DWMNCRP_DISABLED;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY as u32,
+            &policy as *const i32 as *const core::ffi::c_void,
+            4,
+        );
+        // COLOR_NONE 让 DWM 连激活时的 1px 高亮边框 / 标题栏底色都不画。
+        let none: u32 = DWMWA_COLOR_NONE;
+        for attr in [DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR] {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                attr as u32,
+                &none as *const u32 as *const core::ffi::c_void,
+                4,
+            );
+        }
+    }
+}
+
 /// 把窗口样式改成纯弹出式（WS_POPUP）。
 ///
 /// winit 的无边框窗口在 Windows 上仍会保留 `WS_CAPTION | WS_BORDER`，
@@ -321,6 +460,10 @@ pub fn apply_round_region(width: i32, height: i32) {
             return;
         }
         make_popup_window(hwnd);
+        wnd::install(hwnd);
+        // 焦点变化时 DWM 会顺手画一次非客户区（面板顶部一条白色横条）。
+        // 关掉它，边框/标题栏完全由我们自己画。
+        disable_dwm_nc_rendering(hwnd);
 
         // 用真实客户区尺寸裁圆角。InnerSize 是异步生效的，按目标高度裁会在
         // 窗口还没变高时把底栏切掉；按旧高度裁则会在变高后留下直角黑边。
@@ -339,10 +482,11 @@ pub fn apply_round_region(width: i32, height: i32) {
         // 会触发一次无谓重绘，看起来就是弹出时「闪一下」。
         let key = ((w as u64) << 32) | (h as u64);
         if LAST_REGION.swap(key, Ordering::Relaxed) != key {
-            // 区域从第 1 行起裁：系统会在窗口最顶端留一条 1px 边框线，
-            // 它位于 egui 可绘制区之外，只能靠窗口区域切掉。bottom 用 h+1
-            // 让区域一直覆盖到客户区最后一行（参数是排他的）。
-            let rgn = CreateRoundRectRgn(0, 1, w, h + 1, 24, 24);
+            // 顶部 TOP_TRIM 一整条都裁掉：winit 在窗口激活瞬间会写回 WS_CAPTION，
+            // 系统画的标题栏就落在这一带。面板本身从 TOP_TRIM 起绘制，不受影响。
+            // 圆角半径与面板 corners::SHELL 保持一致，避免顶部两角露直角。
+            let trim = crate::theme::metrics::TOP_TRIM as i32;
+            let rgn = CreateRoundRectRgn(0, trim, w, h + 1, 20, 20);
             if !rgn.is_null() {
                 // SetWindowRgn 成功后系统接管 HRGN，不要 DeleteObject。
                 let ok = SetWindowRgn(hwnd, rgn, 1);
