@@ -217,6 +217,40 @@ fn probe_battery(cfg: &Config) -> String {
     out
 }
 
+/// 任务栏之外的可用工作区（物理像素）。
+///
+/// 首次显示与托盘弹出都按它定位，否则窗口会落在系统默认的层叠位置上
+/// （实测每次启动都不一样，还会钻到任务栏底下）。
+#[cfg(windows)]
+pub fn work_area() -> (f32, f32, f32, f32) {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWORKAREA};
+
+    unsafe {
+        let mut r = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let ok = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            &mut r as *mut RECT as *mut core::ffi::c_void,
+            0,
+        );
+        if ok != 0 && r.right > r.left && r.bottom > r.top {
+            return (
+                r.left as f32,
+                r.top as f32,
+                r.right as f32,
+                r.bottom as f32,
+            );
+        }
+    }
+    (0.0, 0.0, 1920.0, 1080.0)
+}
+
 /// 把窗口样式改成纯弹出式（WS_POPUP）。
 ///
 /// winit 的无边框窗口在 Windows 上仍会保留 `WS_CAPTION | WS_BORDER`，

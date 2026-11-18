@@ -12,6 +12,22 @@ use tray_icon::TrayIcon;
 pub const WINDOW_W: f32 = metrics::WINDOW_W;
 /// 面板最多容纳的卡片数，超出部分不再撑高窗口。
 pub const MAX_CARDS: usize = 5;
+/// 任务栏之外的可用区域，换算成 egui 的逻辑坐标。
+fn work_area_logical(ctx: &Context) -> (f32, f32, f32, f32) {
+    let ppp = ctx.pixels_per_point().max(1.0);
+    #[cfg(windows)]
+    let rect = {
+        let (l, t, r, b) = crate::work_area();
+        (l / ppp, t / ppp, r / ppp, b / ppp)
+    };
+    #[cfg(not(windows))]
+    let rect = {
+        let m = ctx.input(|i| i.viewport().monitor_size.unwrap_or(egui::vec2(1920.0, 1080.0)));
+        (0.0, 0.0, m.x, m.y)
+    };
+    rect
+}
+
 /// 按设备数量计算面板高度：单设备时尽量紧凑。
 pub fn window_height(count: usize) -> f32 {
     let n = count.clamp(1, MAX_CARDS) as f32;
@@ -80,6 +96,10 @@ pub struct BatteryApp {
     current_h: f32,
     toast: String,
     toast_at: Option<std::time::Instant>,
+    /// 显示位置锚点（托盘点击的物理坐标）；None 表示放在工作区右下角。
+    anchor: Option<(f32, f32)>,
+    /// 已经下发给窗口的高度。隐藏期间改高度可能不生效，重新显示时要按它校验。
+    applied_h: f32,
     /// 首帧是否已完成「先改窗口样式、再显示」的初始化。
     booted: bool,
     /// 显示后再补一次样式修正，避免 winit 在显示时把边框加回来。
@@ -120,9 +140,24 @@ impl BatteryApp {
             toast: String::new(),
             toast_at: None,
             last_tray_click: None,
+            anchor: None,
+            applied_h: 0.0,
             booted: false,
             restyle_at: None,
         }
+    }
+
+    /// 把窗口高度同步到目标值；`force` 时无条件重发（显示前用，防止隐藏期间的改动丢失）。
+    fn apply_size(&mut self, ctx: &Context, h: f32, force: bool) {
+        self.current_h = h;
+        if !force && (h - self.applied_h).abs() < 0.5 {
+            return;
+        }
+        self.applied_h = h;
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(WINDOW_W, h)));
+        #[cfg(windows)]
+        crate::apply_round_region(WINDOW_W as i32, h as i32);
+        ctx.request_repaint();
     }
 
     fn hide(&mut self, ctx: &Context) {
@@ -140,9 +175,9 @@ impl BatteryApp {
             Page::Devices => window_height(self.snapshot.devices.len()),
         };
         if (h - self.current_h).abs() > 0.5 {
-            self.current_h = h;
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(WINDOW_W, h)));
-            ctx.request_repaint();
+            self.apply_size(ctx, h, false);
+            // 高度变了要重新贴边，否则从设置页切回设备页会留下空档。
+            self.place(ctx);
         }
     }
 
@@ -158,24 +193,47 @@ impl BatteryApp {
         self.visible = true;
         // 重新显示时先不认为「曾经获得焦点」，否则会被失焦自动隐藏立刻收起。
         self.was_focused = false;
-        // 每次显示前都重设一次窗口样式：显示动作可能触发 winit 回写边框样式。
-        #[cfg(windows)]
-        crate::apply_round_region(WINDOW_W as i32, self.current_h as i32);
+        self.anchor = at.map(|(x, y)| (x as f32, y as f32));
+
+        // 收起时页面会回到设备页，但窗口高度可能还停在设置页的 432，
+        // 直接用旧高度弹出来就会多出一大块空白，所以显示前先按当前页面复位。
+        let target_h = match self.page {
+            Page::Settings => metrics::SETTINGS_H,
+            Page::Devices => window_height(self.snapshot.devices.len()),
+        };
+        // 隐藏期间改过的高度不一定被 winit 接受，这里无条件重发一次。
+        self.apply_size(ctx, target_h, true);
+
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        if let Some((x, y)) = at {
-            let ppp = ctx.pixels_per_point().max(1.0);
-            let px = (x / ppp as f64) as f32;
-            let py = (y / ppp as f64) as f32;
-            let (mw, mh) = ctx.input(|i| {
-                let m = i.viewport().monitor_size.unwrap_or(egui::vec2(1920.0, 1080.0));
-                (m.x, m.y)
-            });
-            let left = (px - WINDOW_W + 46.0).clamp(8.0, (mw - WINDOW_W - 8.0).max(8.0));
-            let top = (py - self.current_h - 14.0).clamp(8.0, (mh - self.current_h - 48.0).max(8.0));
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(left, top)));
-        }
+        self.place(ctx);
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.request_repaint();
+    }
+
+    /// 按锚点 / 工作区右下角摆放窗口，并夹在任务栏之外的可见区域内。
+    fn place(&self, ctx: &Context) {
+        let h = self.current_h;
+        let (wl, wt, wr, wb) = work_area_logical(ctx);
+        let (left, top) = match self.anchor {
+            Some((ax, ay)) => {
+                let ppp = ctx.pixels_per_point().max(1.0);
+                let (px, py) = (ax / ppp, ay / ppp);
+                let left =
+                    (px - WINDOW_W + 46.0).clamp(wl + 8.0, (wr - WINDOW_W - 8.0).max(wl + 8.0));
+                // 托盘通常贴在屏幕底部：优先向上弹出，上方放不下再改为向下。
+                let above = py - h - 14.0;
+                let top = if above >= wt + 8.0 { above } else { py + 14.0 };
+                (
+                    left,
+                    top.clamp(wt + 8.0, (wb - h - 8.0).max(wt + 8.0)),
+                )
+            }
+            None => (
+                (wr - WINDOW_W - 12.0).max(wl + 8.0),
+                (wb - h - 12.0).max(wt + 8.0),
+            ),
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(left, top)));
     }
 
     fn refresh(&self) {
@@ -575,12 +633,9 @@ impl eframe::App for BatteryApp {
                 // 窗口是隐藏创建的。趁它还没露面，先把样式改成无边框并裁好圆角，
                 // 否则用户会看到一帧系统标题栏，而且客户区会带着 8/31px 的偏移。
                 self.booted = true;
-                crate::apply_round_region(WINDOW_W as i32, self.current_h as i32);
                 // 触发一次尺寸同步，让渲染表面按新客户区重建。
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                    WINDOW_W,
-                    self.current_h,
-                )));
+                let h = self.current_h;
+                self.apply_size(ctx, h, true);
                 if self.cfg.show_on_start {
                     self.show(ctx, None);
                 }
@@ -625,11 +680,10 @@ impl eframe::App for BatteryApp {
                 self.last_device_count = n;
                 // 设置页有自己的固定高度，别被设备数改写的窗口尺寸打断。
                 if self.page == Page::Devices {
-                    self.current_h = window_height(n);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                        WINDOW_W,
-                        self.current_h,
-                    )));
+                    self.apply_size(ctx, window_height(n), false);
+                    if self.visible {
+                        self.place(ctx);
+                    }
                 }
             }
         }
